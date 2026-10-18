@@ -4,11 +4,11 @@
 //! In order:
 //! 1. `PHOTOCRAFT_CONFIG_DIR`, when set (tests, agents, custom setups).
 //! 2. **Portable mode** (#228): a marker file ([`PORTABLE_MARKERS`]) beside the executable puts
-//!    everything in `<exe dir>/PhotoCraftData`, so a portable copy on a USB stick leaves nothing in
+//!    everything in `<exe dir>/DalivinciData`, so a portable copy on a USB stick leaves nothing in
 //!    `%APPDATA%`. The Windows portable zip ships with `portable.txt`; the MSI doesn't. If that
 //!    folder can't be written (read-only medium, Program Files), the app warns and falls back.
-//! 3. The platform convention: macOS `~/Library/Application Support/Photocraft`, Windows
-//!    `%APPDATA%\Photocraft`, Linux `$XDG_CONFIG_HOME/photocraft` or `~/.config/photocraft`.
+//! 3. The platform convention: macOS `~/Library/Application Support/Dalivinci`, Windows
+//!    `%APPDATA%\Dalivinci`, Linux `$XDG_CONFIG_HOME/dalivinci` or `~/.config/dalivinci`.
 //!
 //! One exception: on Windows the platform convention keeps crash-recovery autosaves out of the
 //! roaming profile ([`recovery_dir`]).
@@ -20,14 +20,17 @@ use std::sync::OnceLock;
 /// Files beside the executable that switch on portable mode (either one; contents are ignored).
 pub const PORTABLE_MARKERS: [&str; 2] = ["portable.txt", "PhotoCraft.portable"];
 /// The data folder created beside the executable in portable mode.
-pub const PORTABLE_DATA_DIR: &str = "PhotoCraftData";
+pub const PORTABLE_DATA_DIR: &str = "DalivinciData";
+/// The per-user folder name under the platform's settings and local-data directories. Dalivinci
+/// uses its own name so it never shares settings or autosaves with an installed PhotoCraft.
+pub const DATA_FOLDER: &str = "Dalivinci";
 
 /// How [`DataDir::dir`] was chosen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     /// `PHOTOCRAFT_CONFIG_DIR`.
     Override,
-    /// `<exe dir>/PhotoCraftData`.
+    /// `<exe dir>/DalivinciData`.
     Portable,
     /// The platform's per-user config directory.
     Platform,
@@ -79,7 +82,7 @@ pub fn recovery_dir() -> Option<PathBuf> {
 
 /// The recovery folder for `data` (#5648). Autosaves hold whole documents and are rewritten every
 /// few minutes, so on Windows the platform convention puts them in the machine-local
-/// `%LOCALAPPDATA%\Photocraft\Recovery`: the roaming `%APPDATA%` may be synced at sign-in and
+/// `%LOCALAPPDATA%\Dalivinci\Recovery`: the roaming `%APPDATA%` may be synced at sign-in and
 /// sign-out or capped by policy. They stay out of `%TEMP%`, which cleanup tools may empty before
 /// a crashed document is recovered. The override and portable folders keep everything in one
 /// place, and other platforms already keep these folders local.
@@ -88,7 +91,7 @@ pub fn resolve_recovery(data: &DataDir, env: impl Fn(&str) -> Option<OsString>) 
         && data.mode == Mode::Platform
         && let Some(local) = env("LOCALAPPDATA").filter(|l| !l.is_empty())
     {
-        return Some(PathBuf::from(local).join("Photocraft").join(RECOVERY));
+        return Some(PathBuf::from(local).join(DATA_FOLDER).join(RECOVERY));
     }
     data.dir.as_ref().map(|d| d.join(RECOVERY))
 }
@@ -461,12 +464,12 @@ pub fn resolve(env: impl Fn(&str) -> Option<OsString>, exe_dir: Option<&Path>) -
 pub fn platform_dir(env: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     let home = env("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
     if cfg!(target_os = "macos") {
-        return home.map(|h| h.join("Library/Application Support/Photocraft"));
+        return home.map(|h| h.join("Library/Application Support").join(DATA_FOLDER));
     }
     if cfg!(windows) {
-        return env("APPDATA").filter(|a| !a.is_empty()).map(|a| PathBuf::from(a).join("Photocraft"));
+        return env("APPDATA").filter(|a| !a.is_empty()).map(|a| PathBuf::from(a).join(DATA_FOLDER));
     }
-    env("XDG_CONFIG_HOME").filter(|x| !x.is_empty()).map(PathBuf::from).or_else(|| home.map(|h| h.join(".config"))).map(|c| c.join("photocraft"))
+    env("XDG_CONFIG_HOME").filter(|x| !x.is_empty()).map(PathBuf::from).or_else(|| home.map(|h| h.join(".config"))).map(|c| c.join(DATA_FOLDER.to_lowercase()))
 }
 
 /// The first portable marker file in `exe_dir`, if any.
@@ -525,11 +528,11 @@ mod tests {
         assert!(!exe.join(PORTABLE_DATA_DIR).exists(), "no portable folder without a marker");
         // The convention per platform.
         if cfg!(target_os = "macos") {
-            assert_eq!(dir, root.join("home/Library/Application Support/Photocraft"));
+            assert_eq!(dir, root.join("home/Library/Application Support").join(DATA_FOLDER));
         } else if cfg!(windows) {
-            assert_eq!(dir, root.join("appdata").join("Photocraft"));
+            assert_eq!(dir, root.join("appdata").join(DATA_FOLDER));
         } else {
-            assert_eq!(dir, root.join("home/.config/photocraft"));
+            assert_eq!(dir, root.join("home/.config").join(DATA_FOLDER.to_lowercase()));
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -604,11 +607,11 @@ mod tests {
     #[test]
     fn autosaves_stay_out_of_the_roaming_profile() {
         let root = temp("recovery-local");
-        let settings = root.join("appdata").join("Photocraft");
+        let settings = root.join("appdata").join(DATA_FOLDER);
         let local = root.join("local");
         let env = env_of(&[("LOCALAPPDATA", &local)]);
         let platform = DataDir { dir: Some(settings.clone()), mode: Mode::Platform, warning: None };
-        let expected = if cfg!(windows) { local.join("Photocraft").join("Recovery") } else { settings.join("Recovery") };
+        let expected = if cfg!(windows) { local.join(DATA_FOLDER).join("Recovery") } else { settings.join("Recovery") };
         assert_eq!(resolve_recovery(&platform, &env), Some(expected));
         for mode in [Mode::Override, Mode::Portable] {
             let d = DataDir { dir: Some(settings.clone()), mode, warning: None };
@@ -634,7 +637,7 @@ mod tests {
     fn autosaves_from_the_old_folder_move_to_the_new_one() {
         let root = temp("recovery-move");
         let legacy = root.join("roaming").join("Recovery");
-        let dir = root.join("local").join("Photocraft").join("Recovery");
+        let dir = root.join("local").join(DATA_FOLDER).join("Recovery");
         autosave(&legacy, "a");
         assert_eq!(adopt_legacy_recovery(&legacy, &dir), dir);
         assert!(!legacy.exists(), "the old folder is gone");

@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> **This is Dalivinci, an unofficial personal fork** of [PhotoCraft](https://github.com/storytold/photocraft) by the ArtCraft team, used to experiment with a built-in AI side panel ("bring your own AI": Claude, Gemini or a local Ollama model). It is not made, supported or endorsed by the PhotoCraft or ArtCraft teams; please don't file issues about it upstream. Everything below this note is the original PhotoCraft README.
+
 <p align="center">
   <a href="https://getartcraft.com/">
     <picture>
