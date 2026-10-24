@@ -141,7 +141,7 @@ impl Default for AiSettings {
         AiSettings {
             ollama_url: "http://localhost:11434/v1".into(),
             ollama_model: "qwen3-vl:30b".into(),
-            gemini_model: "gemini-2.5-flash".into(),
+            gemini_model: "gemini-3.8-flash".into(),
             gemini_url: GEMINI_URL.into(),
         }
     }
