@@ -19,6 +19,8 @@ pub mod adjust_dialog;
 pub mod adjust_editors;
 pub mod adjust_preview;
 pub mod adjust_ui;
+#[cfg(not(target_arch = "wasm32"))]
+mod ai_claude;
 pub mod ai_panel;
 mod alt_grab;
 pub mod analysis_ui;
@@ -451,6 +453,8 @@ pub type CapsLockFn = Box<dyn FnMut() -> bool>;
 /// Keeps an undecorated window's OS frame from offsetting its content and pointer (#2246).
 /// Called once per frame; `None` when the window is decorated or the platform needs no fixing.
 pub type WindowFrameFn = Box<dyn FnMut()>;
+/// Dalivinci: starts the AI panel's private connection to this window ([`Services::ai_bridge`]).
+pub type AiBridgeFn = Box<dyn FnMut() -> Result<ai_panel::Bridge, String>>;
 /// The caption buttons' current style ([`Services::caption_style`]).
 pub type CaptionStyleFn = Box<dyn Fn(&egui::Context) -> CaptionStyle>;
 
@@ -546,6 +550,9 @@ pub struct Services {
     /// style and button layout). Read every frame, with the context to wake when it changes;
     /// `None` keeps Windows' buttons at the right end.
     pub caption_style: Option<CaptionStyleFn>,
+    /// Dalivinci: starts the control connection an AI program (Claude Code) uses to reach this
+    /// window, on the first message to it (desktop only).
+    pub ai_bridge: Option<AiBridgeFn>,
     /// The persistent brush preset store, loading in the background (desktop; see
     /// `photocraft_engine::preset_store`). Attached to the session once it arrives; without
     /// one, brush presets are session-only unless the shell attached a store before startup.
@@ -1817,7 +1824,11 @@ impl PhotocraftApp {
             // `ui.set` may have changed the edit target: the next request sees its colours.
             self.sync_mask_targets();
         }
-        self.control_rx = Some(rx);
+        // Dalivinci: a request above may have connected the AI panel's bridge; keep both.
+        self.control_rx = Some(match self.control_rx.take() {
+            None => rx,
+            Some(added) => ai_panel::merge(rx, added),
+        });
     }
 
     fn issue_screenshots(&mut self, ctx: &egui::Context) {

@@ -17,15 +17,27 @@ use photocraft_ui_egui::control::REPLY_DEADLINE;
 use serde_json::{Value, json};
 
 pub fn start(port: u16, token: String, ctx: egui::Context) -> Receiver<ControlRequest> {
-    let (tx, rx) = channel::<ControlRequest>();
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("photocraft: control server failed to bind 127.0.0.1:{port}: {e}");
-            return rx;
+            return channel::<ControlRequest>().1;
         }
     };
     eprintln!("photocraft: control server listening on 127.0.0.1:{port}");
+    listen(listener, token, ctx)
+}
+
+/// Dalivinci: start the control server on a free loopback port, for the AI panel's private
+/// connection. Returns the port it listens on.
+pub fn start_on_free_port(token: String, ctx: egui::Context) -> std::io::Result<(u16, Receiver<ControlRequest>)> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    Ok((port, listen(listener, token, ctx)))
+}
+
+fn listen(listener: TcpListener, token: String, ctx: egui::Context) -> Receiver<ControlRequest> {
+    let (tx, rx) = channel::<ControlRequest>();
     std::thread::spawn(move || {
         let limiter = ConnectionLimiter::new(MAX_CONNECTIONS);
         let token = Arc::new(token);

@@ -1314,6 +1314,7 @@ pub fn inspect(app: &PhotocraftApp, ctx: &egui::Context) -> Value {
         "magnetic": app.ui.magnetic,
         "textEdit": app.ui.text_edit,
         "typeTransform": app.ui.type_transform,
+        "ai": app.ui.ai,
         "camTransform": app.ui.cam_transform,
         "layerMenu": app.ui.layer_menu,
         "layerPicker": app.ui.layer_picker,

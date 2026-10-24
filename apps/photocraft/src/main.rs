@@ -35,6 +35,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod ai_bridge;
 mod app_dirs;
 mod app_icon;
 mod appearance;
@@ -815,6 +816,11 @@ fn main() -> eframe::Result {
             if let Some((port, token, _)) = control {
                 let rx = control_server::start(port, token, cc.egui_ctx.clone());
                 app = app.with_control(rx);
+            }
+            // Dalivinci: the AI panel starts its own private connection when it first needs one.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                app.services.ai_bridge = Some(ai_bridge::service(cc.egui_ctx.clone()));
             }
             #[cfg(target_os = "macos")]
             {
