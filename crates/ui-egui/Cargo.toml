@@ -45,6 +45,9 @@ flate2 = { workspace = true }
 rayon = { workspace = true }
 # Safe native UI-language APIs (Windows/macOS); no subprocess or web dependency.
 sys-locale = "=0.3.2"
+# Dalivinci: HTTPS to an AI service the user picked (Gemini, Ollama) in the AI Assistant panel
+# (`ai_openai`). Desktop only; nothing connects until the user sends a message to that service.
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
 # Installed RAM for the GPU memory budget (`gpu_canvas::physical_memory`): the safe binding the
 # desktop app already uses, pinned to the same version.

@@ -21,52 +21,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use serde_json::Value;
 
 use crate::ai_panel::{Assistant, Event, McpLink};
-
-/// The MCP server's name in Claude's config; its tools are `mcp__dalivinci__<tool>`.
-const SERVER: &str = "dalivinci";
-
-/// Tools that only look: pre-approved.
-const LOOK_TOOLS: [&str; 8] =
-    ["session_list", "doc_inspect", "doc_render_preview", "render_preview", "command_list", "jobs_list", "ui_inspect", "ui_screenshot"];
-
-/// Tools that edit the open document: allowed when editing is on.
-const EDIT_TOOLS: [&str; 3] = ["command_run", "command_batch", "jobs_cancel"];
-
-/// Tools that open, save or export files, switch documents, or drive the pointer and menus:
-/// always refused.
-const CHANGE_TOOLS: [&str; 13] = [
-    "doc_open",
-    "doc_place",
-    "doc_export_layers",
-    "doc_export_data_sets",
-    "doc_import_data_sets",
-    "doc_new",
-    "doc_save",
-    "doc_export",
-    "doc_select",
-    "doc_close",
-    "ui_pointer",
-    "ui_menu_invoke",
-    "ui_set",
-];
-/// Raw control-protocol calls: refused.
-const RAW_TOOLS: [&str; 1] = ["control_call"];
-
-const ABOUT: &str = "You are the AI assistant inside Dalivinci, a fork of the PhotoCraft image editor, talking to the \
-user in a small side panel. You reach the open document only through the dalivinci tools. Use doc_inspect for the layers \
-and document state, ui_screenshot or doc_render_preview to see the image, ui_inspect for the tools and panels, and \
-command_list (with a filter) to find out which editing commands exist and what parameters they take. Keep replies short \
-and plain; the panel is narrow.";
-
-const LOOK_ONLY: &str = " In this mode you can look but not change anything: describe what you see, and when asked \
-for an edit, explain which menu commands and settings the user can use to do it themselves.";
-
-const CAN_EDIT: &str = " You can edit the open document with command_run and command_batch. Do what was asked and \
-nothing more. Prefer edits that keep the original pixels: adjustment layers, new layers, masks and layer styles over \
-changing the image layer directly. Look up a command's id and parameters with command_list before running it, and look \
-at the result afterwards. Everything you do in one reply becomes a single undo step, so the user can take it all back \
-with one Ctrl+Z; say so if they seem unhappy with the result. You cannot open, save or export files: when the work is \
-done, remind the user to save.";
+use crate::ai_tools::{ABOUT, CAN_EDIT, CHANGE_TOOLS, EDIT_TOOLS, LOOK_ONLY, LOOK_TOOLS, RAW_TOOLS, SERVER, describe};
 
 /// Shown instead of a reply when Claude Code couldn't start Dalivinci's helper.
 const CONNECTION_FAILED: &str = "Claude Code started, but its connection to Dalivinci didn't, so it can't see this window. \
@@ -398,33 +353,6 @@ fn parse_line(line: &str) -> Vec<Msg> {
         _ => {}
     }
     out
-}
-
-/// One action-log line for a tool Claude used (`input` is its arguments).
-fn describe(tool: &str, input: Option<&Value>) -> String {
-    let short = tool.strip_prefix(&format!("mcp__{SERVER}__")).unwrap_or(tool);
-    let id = |v: &Value| v.get("id").and_then(Value::as_str).map(str::to_owned);
-    let what = match short {
-        "session_list" => "Listed the open documents",
-        "doc_inspect" => "Read the layers and document state",
-        "doc_render_preview" | "render_preview" => "Looked at the image",
-        "ui_screenshot" => "Took a screenshot of the window",
-        "ui_inspect" => "Read the tool and panel state",
-        "command_list" => "Looked up the available commands",
-        "jobs_list" => "Checked background jobs",
-        "jobs_cancel" => "Cancelled a background job",
-        "command_run" => return format!("Ran {}", input.and_then(id).unwrap_or_else(|| "a command".into())),
-        "command_batch" => {
-            let ids: Vec<String> = input.and_then(|i| i.get("steps")).and_then(Value::as_array).map(|s| s.iter().filter_map(id).collect()).unwrap_or_default();
-            return match ids.as_slice() {
-                [] => "Ran several commands".into(),
-                [one] => format!("Ran {one}"),
-                many => format!("Ran {} commands: {}", many.len(), many.join(", ")),
-            };
-        }
-        _ => return format!("Tried {short}"),
-    };
-    format!("{what} ({short})")
 }
 
 #[cfg(test)]

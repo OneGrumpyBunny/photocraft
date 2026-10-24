@@ -821,6 +821,7 @@ fn main() -> eframe::Result {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 app.services.ai_bridge = Some(ai_bridge::service(cc.egui_ctx.clone()));
+                app.services.ai_dir = app_dirs::config_dir().map(|d| d.join("ai"));
             }
             #[cfg(target_os = "macos")]
             {

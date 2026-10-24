@@ -29,6 +29,7 @@ const SEND: &str = "ai.send";
 const STOP: &str = "ai.stop";
 const CLEAR: &str = "ai.clear";
 const PROVIDER: &str = "ai.provider";
+const SETTINGS: &str = "ai.settings";
 
 /// The longest message the panel accepts, in characters. A chat message, not a document.
 const MAX_INPUT_CHARS: usize = 8_000;
@@ -63,28 +64,85 @@ pub enum Provider {
     ClaudeCode,
     /// Claude Code, only allowed to look.
     ClaudeCodeLookOnly,
+    /// A local model through Ollama's OpenAI-compatible API.
+    Ollama,
+    /// Google's Gemini through its OpenAI-compatible API (needs an API key).
+    Gemini,
 }
 
+/// Gemini's OpenAI-compatible API.
+pub const GEMINI_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
+
 impl Provider {
-    pub const ALL: [Provider; 3] = [Provider::Echo, Provider::ClaudeCode, Provider::ClaudeCodeLookOnly];
+    pub const ALL: [Provider; 5] = [Provider::Echo, Provider::ClaudeCode, Provider::ClaudeCodeLookOnly, Provider::Ollama, Provider::Gemini];
 
     pub fn label(self) -> &'static str {
         match self {
             Provider::Echo => "Echo (test AI)",
             Provider::ClaudeCode => "Claude Code",
             Provider::ClaudeCodeLookOnly => "Claude Code (look only)",
+            Provider::Ollama => "Ollama (local)",
+            Provider::Gemini => "Gemini",
         }
     }
 
-    fn assistant(self) -> Box<dyn Assistant> {
+    /// Sends the conversation, and pictures of the document, off this computer.
+    pub fn online(self) -> bool {
+        matches!(self, Provider::ClaudeCode | Provider::ClaudeCodeLookOnly | Provider::Gemini)
+    }
+
+    #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+    fn assistant(self, settings: &AiSettings, gemini_key: Option<&str>) -> Box<dyn Assistant> {
+        #[cfg(not(target_arch = "wasm32"))]
+        use crate::ai_openai::{OpenAiCompatible, ServiceConfig};
         match self {
             Provider::Echo => Box::new(Echo::default()),
             #[cfg(not(target_arch = "wasm32"))]
             Provider::ClaudeCode => Box::new(crate::ai_claude::ClaudeCode::new(true)),
             #[cfg(not(target_arch = "wasm32"))]
             Provider::ClaudeCodeLookOnly => Box::new(crate::ai_claude::ClaudeCode::new(false)),
+            #[cfg(not(target_arch = "wasm32"))]
+            Provider::Ollama => Box::new(OpenAiCompatible::new(
+                ServiceConfig { label: "Ollama", base_url: settings.ollama_url.clone(), model: settings.ollama_model.clone(), api_key: None },
+                true,
+            )),
+            #[cfg(not(target_arch = "wasm32"))]
+            Provider::Gemini => match gemini_key.filter(|k| !k.trim().is_empty()) {
+                Some(key) => Box::new(OpenAiCompatible::new(
+                    ServiceConfig {
+                        label: "Gemini",
+                        base_url: settings.gemini_url.clone(),
+                        model: settings.gemini_model.clone(),
+                        api_key: Some(key.trim().to_owned()),
+                    },
+                    true,
+                )),
+                None => Box::new(Unavailable("Gemini needs an API key: paste it under Connection above (get one free at aistudio.google.com).")),
+            },
             #[cfg(target_arch = "wasm32")]
-            Provider::ClaudeCode | Provider::ClaudeCodeLookOnly => Box::new(Unavailable("Claude Code needs the desktop app.")),
+            _ => Box::new(Unavailable("This AI needs the desktop app.")),
+        }
+    }
+}
+
+/// Where the AI services are and which models to use.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AiSettings {
+    pub ollama_url: String,
+    pub ollama_model: String,
+    pub gemini_model: String,
+    /// Gemini's API address (its OpenAI-compatible endpoint), changeable for a proxy.
+    pub gemini_url: String,
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        AiSettings {
+            ollama_url: "http://localhost:11434/v1".into(),
+            ollama_model: "qwen3-vl:30b".into(),
+            gemini_model: "gemini-2.5-flash".into(),
+            gemini_url: GEMINI_URL.into(),
         }
     }
 }
@@ -130,6 +188,67 @@ impl std::fmt::Debug for Slot {
     }
 }
 
+/// The Connection section's state: the key being typed, and a service's model list.
+#[derive(Default)]
+struct ConnectionForm {
+    key_input: String,
+    models: Vec<String>,
+    models_rx: Option<std::sync::mpsc::Receiver<Result<Vec<String>, String>>>,
+    note: Option<String>,
+}
+
+impl Clone for ConnectionForm {
+    fn clone(&self) -> Self {
+        ConnectionForm::default()
+    }
+}
+
+impl std::fmt::Debug for ConnectionForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionForm").field("models", &self.models.len()).finish_non_exhaustive()
+    }
+}
+
+/// Gemini's key file in the AI folder, readable only by this user.
+const GEMINI_KEY_FILE: &str = "gemini.key";
+
+/// Read Gemini's key once: its private file, else `GEMINI_API_KEY`.
+fn load_gemini_key(app: &mut PhotocraftApp) {
+    if app.ui.ai.key_loaded {
+        return;
+    }
+    app.ui.ai.key_loaded = true;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let from_file = app.services.ai_dir.as_ref().and_then(|d| std::fs::read_to_string(d.join(GEMINI_KEY_FILE)).ok());
+        let from_env = || std::env::var("GEMINI_API_KEY").ok();
+        app.ui.ai.gemini_key = from_file.or_else(from_env).map(|k| k.trim().to_owned()).filter(|k| !k.is_empty());
+    }
+}
+
+/// Save (or, with an empty key, forget) Gemini's key in its private file.
+#[cfg(not(target_arch = "wasm32"))]
+fn store_gemini_key(app: &mut PhotocraftApp, key: &str) -> Result<(), String> {
+    let dir = app.services.ai_dir.clone().ok_or("there's no settings folder to keep the key in")?;
+    let path = dir.join(GEMINI_KEY_FILE);
+    let key = key.trim();
+    if key.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        app.ui.ai.gemini_key = None;
+    } else {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        std::io::Write::write_all(&mut file, key.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
+        app.ui.ai.gemini_key = Some(key.to_owned());
+    }
+    app.ui.ai.reconfigure();
+    Ok(())
+}
+
 /// AI Assistant panel view state. The conversation is exposed to automation but never restored
 /// from settings: only whether the panel is open survives a restart.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -139,6 +258,20 @@ pub struct AiPanelUi {
     /// The AI picked at the top of the panel.
     #[serde(default)]
     pub provider: Provider,
+    /// Only AIs that run on this computer may be used: nothing is sent off it.
+    #[serde(default)]
+    pub local_only: bool,
+    #[serde(default)]
+    pub settings: AiSettings,
+    /// Gemini's API key, read from its private file (or `GEMINI_API_KEY`) when first needed. Never
+    /// in the settings file.
+    #[serde(skip)]
+    gemini_key: Option<String>,
+    #[serde(skip)]
+    key_loaded: bool,
+    /// The connection section's edits, and the models a service listed.
+    #[serde(skip)]
+    form: ConnectionForm,
     #[serde(default, skip_deserializing)]
     pub messages: Vec<Message>,
     /// What the AI did, oldest first: one line per command it ran.
@@ -163,6 +296,8 @@ impl PartialEq for AiPanelUi {
     fn eq(&self, other: &Self) -> bool {
         self.open == other.open
             && self.provider == other.provider
+            && self.local_only == other.local_only
+            && self.settings == other.settings
             && self.messages == other.messages
             && self.actions == other.actions
             && self.busy == other.busy
@@ -242,11 +377,9 @@ impl Assistant for Echo {
     }
 }
 
-/// An AI this build can't run: every turn answers with why.
-#[cfg(target_arch = "wasm32")]
+/// An AI that can't run (not on this build, or not set up): every turn answers with why.
 struct Unavailable(&'static str);
 
-#[cfg(target_arch = "wasm32")]
 impl Assistant for Unavailable {
     fn name(&self) -> &'static str {
         "Unavailable"
@@ -260,15 +393,35 @@ impl Assistant for Unavailable {
 
 impl AiPanelUi {
     fn assistant(&mut self) -> &mut Box<dyn Assistant> {
-        let provider = self.provider;
-        self.assistant.0.get_or_insert_with(|| provider.assistant())
+        let (provider, settings, key) = (self.provider, self.settings.clone(), self.gemini_key.clone());
+        self.assistant.0.get_or_insert_with(|| provider.assistant(&settings, key.as_deref()))
     }
 
-    /// Talk to another AI: ends the current turn and starts a new conversation.
-    pub fn set_provider(&mut self, provider: Provider) {
+    /// Talk to another AI: ends the current turn and starts a new conversation. With Local only
+    /// on, an online AI is refused.
+    pub fn set_provider(&mut self, provider: Provider) -> Result<(), String> {
+        if self.local_only && provider.online() {
+            return Err(format!("{} sends your conversation and pictures off this computer: turn off Local only to use it", provider.label()));
+        }
         if provider != self.provider {
             self.clear();
             self.provider = provider;
+            self.assistant.0 = None;
+        }
+        Ok(())
+    }
+
+    /// Turn Local only on or off. Turning it on while an online AI is picked switches to Ollama.
+    pub fn set_local_only(&mut self, on: bool) {
+        self.local_only = on;
+        if on && self.provider.online() {
+            let _ = self.set_provider(Provider::Ollama);
+        }
+    }
+
+    /// New service settings or key: the next message uses them (and the AI starts a new memory).
+    fn reconfigure(&mut self) {
+        if !self.busy {
             self.assistant.0 = None;
         }
     }
@@ -290,6 +443,9 @@ impl AiPanelUi {
         }
         if self.busy {
             return Err("the AI is still answering: stop it first".into());
+        }
+        if self.local_only && self.provider.online() {
+            return Err("Local only is on: pick an AI that runs on this computer".into());
         }
         if let Some(link) = self.link.clone() {
             self.assistant().connect(link);
@@ -356,6 +512,7 @@ impl AiPanelUi {
 
 /// Send `text` from the panel or automation: starts the bridge first when the AI needs it.
 pub fn send(app: &mut PhotocraftApp, text: &str) -> Result<(), String> {
+    load_gemini_key(app);
     if !app.ui.ai.busy && !text.trim().is_empty() && app.ui.ai.wants_bridge() {
         let link = connect_bridge(app)?;
         app.ui.ai.link = Some(link);
@@ -454,7 +611,7 @@ pub(crate) fn merge(a: std::sync::mpsc::Receiver<ControlRequest>, b: std::sync::
 
 /// Ids this module owns.
 pub fn handles(id: &str) -> bool {
-    matches!(id, TOGGLE | SEND | STOP | CLEAR | PROVIDER)
+    matches!(id, TOGGLE | SEND | STOP | CLEAR | PROVIDER | SETTINGS)
 }
 
 /// Menu checkmark for Window › AI Assistant.
@@ -489,12 +646,27 @@ pub fn menu(app: &mut PhotocraftApp, id: &str, params: &Value) -> Option<Result<
             Ok(json!({}))
         }
         PROVIDER => match params.get("provider").cloned().map(serde_json::from_value::<Provider>) {
-            Some(Ok(p)) => {
-                ai.set_provider(p);
-                Ok(json!({ "provider": p }))
-            }
-            _ => Err("ai.provider needs {\"provider\": \"echo\" | \"claudeCode\"}".into()),
+            Some(Ok(p)) => ai.set_provider(p).map(|()| json!({ "provider": p })),
+            _ => Err("ai.provider needs {\"provider\": \"echo\" | \"claudeCode\" | \"claudeCodeLookOnly\" | \"ollama\" | \"gemini\"}".into()),
         },
+        SETTINGS => {
+            let mut merged = serde_json::to_value(&ai.settings).unwrap_or_default();
+            if let (Some(m), Some(changes)) = (merged.as_object_mut(), params.as_object()) {
+                for (k, v) in changes {
+                    if m.contains_key(k) {
+                        m.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            match serde_json::from_value::<AiSettings>(merged) {
+                Ok(settings) => {
+                    ai.settings = settings;
+                    ai.reconfigure();
+                    serde_json::to_value(&ai.settings).map_err(|e| e.to_string())
+                }
+                Err(e) => Err(format!("ai.settings: {e}")),
+            }
+        }
         _ => return None,
     })
 }
@@ -532,6 +704,8 @@ pub fn side_panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
 fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, t: &Tokens) {
     let mut to_send: Option<String> = None;
     let mut pick: Option<Provider> = None;
+    let mut local_only: Option<bool> = None;
+    load_gemini_key(app);
     let ai = &mut app.ui.ai;
     // Header: title, the connected AI, and close.
     ui.horizontal(|ui| {
@@ -548,13 +722,26 @@ fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, t: &Tokens) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("AI:").small().color(t.text_dim));
         egui::ComboBox::from_id_salt("ai_provider").selected_text(ai.assistant_name()).show_ui(ui, |ui| {
-            for p in Provider::ALL {
+            for p in Provider::ALL.into_iter().filter(|p| !(ai.local_only && p.online())) {
                 if ui.selectable_label(p == ai.provider, p.label()).clicked() {
                     pick = Some(p);
                 }
             }
         });
     });
+    let mut local = ai.local_only;
+    if ui
+        .checkbox(&mut local, RichText::new("Local only").small().color(t.text_dim))
+        .on_hover_text("Only AIs that run on this computer: your conversation and pictures stay here.")
+        .changed()
+    {
+        local_only = Some(local);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if matches!(ai.provider, Provider::Ollama | Provider::Gemini) {
+        connection(app, ui, t);
+    }
+    let ai = &mut app.ui.ai;
     ui.separator();
 
     // Input area pinned to the bottom; the conversation fills what's left.
@@ -599,8 +786,13 @@ fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, t: &Tokens) {
         ui.add_space(2.0);
     });
 
-    if let Some(p) = pick {
-        app.ui.ai.set_provider(p);
+    if let Some(p) = pick
+        && let Err(e) = app.ui.ai.set_provider(p)
+    {
+        app.ui.ai.push(Role::Notice, e);
+    }
+    if let Some(on) = local_only {
+        app.ui.ai.set_local_only(on);
     }
     if let Some(text) = to_send
         && let Err(e) = send(app, &text)
@@ -621,6 +813,123 @@ fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, t: &Tokens) {
             message(ui, t, m);
         }
     });
+}
+
+/// The Connection section for Ollama and Gemini: address, model (with the service's list), and
+/// Gemini's API key.
+#[cfg(not(target_arch = "wasm32"))]
+fn connection(app: &mut PhotocraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    let ai = &mut app.ui.ai;
+    if let Some(rx) = ai.form.models_rx.as_ref()
+        && let Ok(result) = rx.try_recv()
+    {
+        ai.form.models_rx = None;
+        match result {
+            Ok(models) if models.is_empty() => ai.form.note = Some("The service listed no models.".into()),
+            Ok(models) => {
+                ai.form.models = models;
+                ai.form.note = None;
+            }
+            Err(e) => ai.form.note = Some(e),
+        }
+    }
+    let gemini = ai.provider == Provider::Gemini;
+    let needs_key = gemini && ai.gemini_key.is_none();
+    let mut save_key: Option<String> = None;
+    let mut changed = false;
+    egui::CollapsingHeader::new(RichText::new("Connection").small().color(t.text_dim)).id_salt("ai_connection").default_open(needs_key).show(ui, |ui| {
+        let settings = &mut ai.settings;
+        if !gemini {
+            ui.label(RichText::new("Address").small().color(t.text_dim));
+            changed |= ui.add(egui::TextEdit::singleline(&mut settings.ollama_url).desired_width(f32::INFINITY)).lost_focus();
+        }
+        ui.label(RichText::new("Model").small().color(t.text_dim));
+        let model = if gemini { &mut settings.gemini_model } else { &mut settings.ollama_model };
+        ui.horizontal(|ui| {
+            changed |= ui.add(egui::TextEdit::singleline(model).desired_width(ui.available_width() - 70.0)).lost_focus();
+            let listing = ai.form.models_rx.is_some();
+            if ui
+                .add_enabled(!listing && (!gemini || ai.gemini_key.is_some()), egui::Button::new(if listing { "…" } else { "List" }))
+                .on_hover_text("Ask the service which models it has")
+                .clicked()
+            {
+                let config = crate::ai_openai::ServiceConfig {
+                    label: if gemini { "Gemini" } else { "Ollama" },
+                    base_url: if gemini { settings.gemini_url.clone() } else { settings.ollama_url.clone() },
+                    model: String::new(),
+                    api_key: if gemini { ai.gemini_key.clone() } else { None },
+                };
+                let (tx, rx) = std::sync::mpsc::channel();
+                let ctx = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(crate::ai_openai::list_models(&config));
+                    ctx.request_repaint();
+                });
+                ai.form.models_rx = Some(rx);
+            }
+        });
+        if !ai.form.models.is_empty() {
+            egui::ScrollArea::vertical().id_salt("ai_models").max_height(110.0).show(ui, |ui| {
+                for m in &ai.form.models {
+                    let current = if gemini { &settings.gemini_model } else { &settings.ollama_model };
+                    if ui.selectable_label(m == current, RichText::new(m).small()).clicked() {
+                        if gemini {
+                            settings.gemini_model = m.clone();
+                        } else {
+                            settings.ollama_model = m.clone();
+                        }
+                        changed = true;
+                    }
+                }
+            });
+        }
+        if gemini {
+            ui.label(RichText::new("API key").small().color(t.text_dim));
+            if ai.gemini_key.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Saved on this computer").small().color(t.text_dim));
+                    if ui.small_button("Forget").clicked() {
+                        save_key = Some(String::new());
+                    }
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut ai.form.key_input)
+                            .password(true)
+                            .hint_text("Paste your key")
+                            .desired_width(ui.available_width() - 70.0),
+                    );
+                    if ui.add_enabled(!ai.form.key_input.trim().is_empty(), egui::Button::new("Save")).clicked() {
+                        save_key = Some(std::mem::take(&mut ai.form.key_input));
+                    }
+                });
+                ui.label(
+                    RichText::new("Free keys: aistudio.google.com. On the free tier Google may use what you send to improve its products.")
+                        .small()
+                        .color(t.text_faint),
+                );
+            }
+        }
+        if !gemini {
+            ui.label(
+                RichText::new("Tip: start Ollama with OLLAMA_CONTEXT_LENGTH=32768 (or more). Its default of 4096 is too small for the tools and pictures, and the model loses track.")
+                    .small()
+                    .color(t.text_faint),
+            );
+        }
+        if let Some(note) = &ai.form.note {
+            ui.label(RichText::new(note).small().color(t.warning));
+        }
+    });
+    if changed {
+        ai.reconfigure();
+    }
+    if let Some(key) = save_key
+        && let Err(e) = store_gemini_key(app, &key)
+    {
+        app.ui.ai.form.note = Some(e);
+    }
 }
 
 fn message(ui: &mut egui::Ui, t: &Tokens, m: &Message) {
@@ -823,6 +1132,59 @@ mod tests {
         connect_bridge(&mut app).unwrap();
         let authorize = app.services.automation_command.as_ref().unwrap();
         assert_eq!(authorize("anything", &json!({})), Err("the --control policy".to_string()));
+    }
+
+    #[test]
+    fn local_only_keeps_online_ais_out() {
+        let mut ai = AiPanelUi::default();
+        ai.set_provider(Provider::Gemini).unwrap();
+        ai.set_local_only(true);
+        assert_eq!(ai.provider, Provider::Ollama, "turning it on leaves the online AI");
+        for online in [Provider::Gemini, Provider::ClaudeCode, Provider::ClaudeCodeLookOnly] {
+            assert!(ai.set_provider(online).is_err(), "{online:?}");
+        }
+        assert!(ai.set_provider(Provider::Echo).is_ok() && ai.set_provider(Provider::Ollama).is_ok());
+        // Even if a stale setting says otherwise, nothing online is sent.
+        ai.provider = Provider::Gemini;
+        assert!(ai.send("hi", 0.0).is_err());
+        ai.set_local_only(false);
+        assert!(ai.set_provider(Provider::Gemini).is_ok());
+        assert!(!Provider::Ollama.online() && !Provider::Echo.online());
+    }
+
+    #[test]
+    fn gemini_without_a_key_says_where_to_get_one() {
+        let mut ai = AiPanelUi::default();
+        ai.set_provider(Provider::Gemini).unwrap();
+        ai.link = Some(McpLink { command: "x".into(), args: Vec::new(), work_dir: std::env::temp_dir() });
+        ai.send("hi", 0.0).unwrap();
+        ai.poll(0.1);
+        let reply = &ai.messages.last().unwrap().text;
+        assert!(reply.contains("API key") && reply.contains("aistudio.google.com"), "{reply}");
+        assert!(!ai.busy);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_gemini_key_is_kept_in_a_private_file_not_the_settings() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("dalivinci-key-{}", std::process::id()));
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.services.ai_dir = Some(dir.clone());
+        store_gemini_key(&mut app, "  secret-123 \n").unwrap();
+        let file = dir.join(GEMINI_KEY_FILE);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "secret-123");
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!serde_json::to_string(&app.ui.ai).unwrap().contains("secret"), "never in the UI state");
+        // A fresh start reads it back.
+        let mut again = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        again.services.ai_dir = Some(dir.clone());
+        load_gemini_key(&mut again);
+        assert_eq!(again.ui.ai.gemini_key.as_deref(), Some("secret-123"));
+        // Forget.
+        store_gemini_key(&mut app, "").unwrap();
+        assert!(!file.exists() && app.ui.ai.gemini_key.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -21,7 +21,11 @@ pub mod adjust_preview;
 pub mod adjust_ui;
 #[cfg(not(target_arch = "wasm32"))]
 mod ai_claude;
+#[cfg(not(target_arch = "wasm32"))]
+mod ai_openai;
 pub mod ai_panel;
+#[cfg(not(target_arch = "wasm32"))]
+mod ai_tools;
 mod alt_grab;
 pub mod analysis_ui;
 pub mod anchor_tools;
@@ -553,6 +557,8 @@ pub struct Services {
     /// Dalivinci: starts the control connection an AI program (Claude Code) uses to reach this
     /// window, on the first message to it (desktop only).
     pub ai_bridge: Option<AiBridgeFn>,
+    /// Dalivinci: the AI panel's private folder (Gemini's key file), desktop only.
+    pub ai_dir: Option<std::path::PathBuf>,
     /// The persistent brush preset store, loading in the background (desktop; see
     /// `photocraft_engine::preset_store`). Attached to the session once it arrives; without
     /// one, brush presets are session-only unless the shell attached a store before startup.
