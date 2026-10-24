@@ -407,6 +407,8 @@ impl AiPanelUi {
             self.clear();
             self.provider = provider;
             self.assistant.0 = None;
+            self.form.models.clear();
+            self.form.models_rx = None;
         }
         Ok(())
     }
@@ -869,19 +871,25 @@ fn connection(app: &mut PhotocraftApp, ui: &mut egui::Ui, t: &Tokens) {
             }
         });
         if !ai.form.models.is_empty() {
+            let mut picked = None;
             egui::ScrollArea::vertical().id_salt("ai_models").max_height(110.0).show(ui, |ui| {
                 for m in &ai.form.models {
                     let current = if gemini { &settings.gemini_model } else { &settings.ollama_model };
                     if ui.selectable_label(m == current, RichText::new(m).small()).clicked() {
-                        if gemini {
-                            settings.gemini_model = m.clone();
-                        } else {
-                            settings.ollama_model = m.clone();
-                        }
-                        changed = true;
+                        picked = Some(m.clone());
                     }
                 }
             });
+            // Picking a model closes the list; List opens it again.
+            if let Some(m) = picked {
+                if gemini {
+                    settings.gemini_model = m;
+                } else {
+                    settings.ollama_model = m;
+                }
+                ai.form.models.clear();
+                changed = true;
+            }
         }
         if gemini {
             ui.label(RichText::new("API key").small().color(t.text_dim));
@@ -1132,6 +1140,15 @@ mod tests {
         connect_bridge(&mut app).unwrap();
         let authorize = app.services.automation_command.as_ref().unwrap();
         assert_eq!(authorize("anything", &json!({})), Err("the --control policy".to_string()));
+    }
+
+    #[test]
+    fn another_ai_drops_the_model_list() {
+        let mut ai = AiPanelUi::default();
+        ai.set_provider(Provider::Ollama).unwrap();
+        ai.form.models = vec!["qwen3-vl:30b".into()];
+        ai.set_provider(Provider::Gemini).unwrap();
+        assert!(ai.form.models.is_empty(), "Ollama's models are not Gemini's");
     }
 
     #[test]
