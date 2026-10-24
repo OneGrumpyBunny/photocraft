@@ -31,6 +31,8 @@ const MAX_RESULT_CHARS: usize = 20_000;
 const MAX_DESCRIPTION_CHARS: usize = 1_200;
 /// Most lines read from the MCP server while waiting for one reply.
 const MAX_MCP_LINES: usize = 10_000;
+/// Waits before retrying a request the service turned away as busy (500, 502, 503, 504).
+const BUSY_RETRIES: [Duration; 3] = [Duration::from_secs(3), Duration::from_secs(8), Duration::from_secs(20)];
 
 /// Added to the instructions for these services: they see images only when a tool returns one.
 const HOW_TO_LOOK: &str = " To see the image, call doc_render_preview; the picture comes back in the next message.";
@@ -149,6 +151,28 @@ impl Turn {
         self.stop.load(Ordering::Relaxed)
     }
 
+    /// A chat request, retried a few times while the service says it is busy. None if Stop was
+    /// pressed while waiting.
+    fn chat_retrying(&self, agent: &ureq::Agent, messages: &[Value], tools: &[Value]) -> Option<Result<Value, String>> {
+        let mut waits = BUSY_RETRIES.iter();
+        loop {
+            match chat(agent, &self.config, messages, tools) {
+                Err(ChatError { status: Some(500 | 502..=504), message }) => {
+                    let Some(&wait) = waits.next() else { return Some(Err(message)) };
+                    let _ = self.tx.send(Event::Action(format!("{} is busy; trying again in {} s", self.config.label, wait.as_secs())));
+                    let until = std::time::Instant::now() + wait;
+                    while std::time::Instant::now() < until {
+                        if self.stopped() {
+                            return None;
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+                other => return Some(other.map_err(|e| e.message)),
+            }
+        }
+    }
+
     fn run_inner(&self, prompt: &str) -> Result<(), String> {
         let mut mcp = Mcp::start(&self.link)?;
         let tools = mcp.tools(self.can_edit)?;
@@ -163,7 +187,10 @@ impl Turn {
             if self.stopped() {
                 return Ok(());
             }
-            let reply = chat(&agent, &self.config, &messages, &tools)?;
+            let reply = match self.chat_retrying(&agent, &messages, &tools) {
+                Some(reply) => reply?,
+                None => return Ok(()),
+            };
             if self.stopped() {
                 return Ok(());
             }
@@ -260,8 +287,21 @@ fn agent() -> ureq::Agent {
     ureq::Agent::config_builder().timeout_global(Some(REQUEST_TIMEOUT)).http_status_as_error(false).build().into()
 }
 
+/// A failed chat request: the HTTP status, if the service answered, and what to tell the user.
+#[derive(Debug)]
+struct ChatError {
+    status: Option<u16>,
+    message: String,
+}
+
+impl From<String> for ChatError {
+    fn from(message: String) -> Self {
+        ChatError { status: None, message }
+    }
+}
+
 /// One chat-completions request; returns the reply message.
-fn chat(agent: &ureq::Agent, config: &ServiceConfig, messages: &[Value], tools: &[Value]) -> Result<Value, String> {
+fn chat(agent: &ureq::Agent, config: &ServiceConfig, messages: &[Value], tools: &[Value]) -> Result<Value, ChatError> {
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let mut body = json!({ "model": config.model, "messages": messages });
     if !tools.is_empty() {
@@ -274,11 +314,17 @@ fn chat(agent: &ureq::Agent, config: &ServiceConfig, messages: &[Value], tools: 
     }
     let mut response = request.send_json(&body).map_err(|e| unreachable_message(config, &e.to_string()))?;
     let status = response.status().as_u16();
-    let reply: Value = response.body_mut().read_json().map_err(|e| format!("{}: the reply wasn't readable ({e}).", config.label))?;
+    let reply = response.body_mut().read_json::<Value>();
+    // An error reply may not be JSON (a gateway's busy page); its status still counts.
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(_) if !(200..300).contains(&status) => Value::Null,
+        Err(e) => return Err(format!("{}: the reply wasn't readable ({e}).", config.label).into()),
+    };
     if !(200..300).contains(&status) {
-        return Err(http_error(config, status, &reply));
+        return Err(ChatError { status: Some(status), message: http_error(config, status, &reply) });
     }
-    reply.pointer("/choices/0/message").cloned().ok_or_else(|| format!("{}: the reply had no message.", config.label))
+    Ok(reply.pointer("/choices/0/message").cloned().ok_or_else(|| format!("{}: the reply had no message.", config.label))?)
 }
 
 fn unreachable_message(config: &ServiceConfig, error: &str) -> String {
@@ -299,7 +345,10 @@ fn http_error(config: &ServiceConfig, status: u16, reply: &Value) -> String {
     let hint = match status {
         401 | 403 => " Check the API key.",
         404 => " Check the model name and address.",
-        429 => " The service's rate limit or quota was reached; wait a moment.",
+        429 => {
+            " The service's rate limit or quota was reached: wait a minute, or pick another model. Free tiers allow only a few requests a minute, and some models (image generators especially) have no free quota."
+        }
+        500 | 502..=504 => " The model is busy right now: try again shortly, or pick another model.",
         _ => "",
     };
     format!("{} answered with an error ({status}): {detail}.{hint}", config.label)
@@ -528,8 +577,31 @@ mod tests {
         let gemini = ServiceConfig { label: "Gemini", base_url: "https://x/v1".into(), model: "m".into(), api_key: Some("k".into()) };
         assert!(http_error(&gemini, 401, &json!([{ "error": { "message": "API key not valid" } }])).contains("API key not valid. Check the API key."));
         assert!(http_error(&gemini, 404, &json!({ "error": { "message": "model not found" } })).contains("Check the model name"));
+        assert!(http_error(&gemini, 429, &json!({ "error": { "message": "quota exceeded" } })).contains("no free quota"));
         let ollama = ServiceConfig { label: "Ollama", base_url: "http://localhost:11434/v1".into(), model: "qwen3-vl:30b".into(), api_key: None };
         assert!(unreachable_message(&ollama, "connection refused").contains("ollama serve"));
+    }
+
+    #[test]
+    fn a_busy_reply_keeps_its_status_even_without_json() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "<html>Service Unavailable</html>";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        let config = ServiceConfig { label: "Gemini", base_url: format!("http://127.0.0.1:{port}/v1"), model: "m".into(), api_key: Some("k".into()) };
+        let err = chat(&agent(), &config, &[json!({ "role": "user", "content": "hi" })], &[]).unwrap_err();
+        assert_eq!(err.status, Some(503));
+        assert!(err.message.contains("busy"), "{}", err.message);
     }
 
     #[test]
