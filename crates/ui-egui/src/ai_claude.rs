@@ -55,6 +55,10 @@ and command_list to find out which editing commands exist. In this version you c
 describe what you see, and when asked for an edit, explain which menu commands and settings the user can use to do it \
 themselves. Keep replies short and plain; the panel is narrow.";
 
+/// Shown instead of a reply when Claude Code couldn't start Dalivinci's helper.
+const CONNECTION_FAILED: &str = "Claude Code started, but its connection to Dalivinci didn't, so it can't see this window. \
+Its log of this turn is claude-last-turn.log in DalivinciData/ai beside the program.";
+
 /// Most bytes of the program's error output kept for an error message.
 const STDERR_TAIL: usize = 2_000;
 
@@ -124,7 +128,8 @@ impl Assistant for ClaudeCode {
             }
         }
         if events.contains(&Event::Done) {
-            self.reap();
+            // Usually it has exited already; after an early stop (a failed connection) it hasn't.
+            self.stop();
         }
         events
     }
@@ -133,17 +138,6 @@ impl Assistant for ClaudeCode {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             // Collect the exit status off the UI thread so no zombie is left behind.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
-        self.rx = None;
-    }
-}
-
-impl ClaudeCode {
-    fn reap(&mut self) {
-        if let Some(mut child) = self.child.take() {
             std::thread::spawn(move || {
                 let _ = child.wait();
             });
@@ -163,19 +157,65 @@ fn fail(tx: &Sender<Msg>, message: String) {
     let _ = tx.send(Msg::Event(Event::Done));
 }
 
-/// The `claude` program: `DALIVINCI_CLAUDE` when set, else `claude` on the PATH, else the
-/// native installer's `~/.local/bin/claude` (a desktop launcher may not have it on the PATH).
-fn program() -> std::path::PathBuf {
-    if let Some(p) = std::env::var_os("DALIVINCI_CLAUDE").filter(|p| !p.is_empty()) {
-        return p.into();
+/// The `claude` program: `$DALIVINCI_CLAUDE` when set, else the native installer's
+/// `~/.local/bin/claude`, else the first `claude` on the PATH (a desktop launcher may not have
+/// `~/.local/bin` on it).
+///
+/// Under WSL the PATH also lists Windows' folders, and the Windows Claude Code found there runs its
+/// MCP servers through cmd.exe, which can't start this Linux build's helper: the connection closes
+/// at once. So on Linux, copies on Windows drives (`/mnt/<drive>/…`) and `.exe` files are skipped,
+/// and if that's all there is, the panel says so.
+fn program() -> Result<std::path::PathBuf, String> {
+    if cfg!(windows) {
+        return Ok("claude".into());
     }
-    let local = std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".local/bin/claude"));
-    let on_path =
-        std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join("claude").is_file() || d.join("claude.exe").is_file()));
-    match local {
-        Some(l) if !on_path && l.is_file() => l,
-        _ => "claude".into(),
+    find_program(std::env::var_os("DALIVINCI_CLAUDE"), std::env::var_os("HOME").map(std::path::PathBuf::from), std::env::var_os("PATH"), |p| p.is_file())
+}
+
+fn find_program(
+    chosen: Option<std::ffi::OsString>,
+    home: Option<std::path::PathBuf>,
+    path: Option<std::ffi::OsString>,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Result<std::path::PathBuf, String> {
+    if let Some(p) = chosen.filter(|p| !p.is_empty()) {
+        return Ok(p.into());
     }
+    let local = home.map(|h| h.join(".local/bin/claude"));
+    let on_path = path.iter().flat_map(std::env::split_paths).flat_map(|d| [d.join("claude"), d.join("claude.exe")]);
+    let mut windows = None;
+    for candidate in local.into_iter().chain(on_path) {
+        if !exists(&candidate) {
+            continue;
+        }
+        if on_windows_side(&candidate) {
+            windows.get_or_insert(candidate);
+        } else {
+            return Ok(candidate);
+        }
+    }
+    Err(match windows {
+        Some(w) => format!(
+            "Only the Windows version of Claude Code was found ({}), and it can't start Dalivinci's Linux helper. Install Claude Code inside WSL with: curl -fsSL https://claude.ai/install.sh | bash \u{2014} then run ~/.local/bin/claude once to sign in, and try again.",
+            w.display()
+        ),
+        None => NOT_INSTALLED.into(),
+    })
+}
+
+const NOT_INSTALLED: &str = "Claude Code isn't installed where Dalivinci can find it. Install it (curl -fsSL https://claude.ai/install.sh | bash), run `claude` once to sign in, then try again.";
+
+/// A Windows program seen from WSL: on a Windows drive (`/mnt/c/…`) or an `.exe`.
+fn on_windows_side(p: &std::path::Path) -> bool {
+    let mut parts = p.components().map(|c| c.as_os_str().to_string_lossy().into_owned());
+    let drive = matches!((parts.next().as_deref(), parts.next().as_deref(), parts.next()), (Some("/"), Some("mnt"), Some(d)) if d.len() == 1);
+    drive || p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+}
+
+/// Claude Code's debug log of the latest turn, beside the work folder: what to look at, or send,
+/// when the connection fails.
+fn debug_log(link: &McpLink) -> std::path::PathBuf {
+    link.work_dir.parent().unwrap_or(&link.work_dir).join("claude-last-turn.log")
 }
 
 /// The MCP config handed to Claude: just this window's bridge.
@@ -219,15 +259,19 @@ fn args(link: &McpLink, prompt: &str, session: Option<&str>) -> Vec<String> {
 
 fn spawn(link: &McpLink, prompt: &str, session: Option<&str>) -> Result<Child, String> {
     let _ = std::fs::create_dir_all(&link.work_dir);
-    Command::new(program())
+    let log = debug_log(link);
+    let _ = std::fs::remove_file(&log);
+    Command::new(program()?)
         .args(args(link, prompt, session))
+        .arg("--debug-file")
+        .arg(&log)
         .current_dir(&link.work_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => "Claude Code isn't installed where Dalivinci can find it. Install it (curl -fsSL https://claude.ai/install.sh | bash), run `claude` once to sign in, then try again.".to_owned(),
+            std::io::ErrorKind::NotFound => NOT_INSTALLED.to_owned(),
             _ => format!("Couldn't start Claude Code: {e}"),
         })
 }
@@ -286,7 +330,15 @@ fn parse_line(line: &str) -> Vec<Msg> {
     let mut out = Vec::new();
     let session = || v.get("session_id").and_then(Value::as_str).map(|s| Msg::Session(s.to_owned()));
     match v.get("type").and_then(Value::as_str) {
-        Some("system") if v.get("subtype").and_then(Value::as_str) == Some("init") => out.extend(session()),
+        Some("system") if v.get("subtype").and_then(Value::as_str) == Some("init") => {
+            out.extend(session());
+            let ours =
+                v.get("mcp_servers").and_then(Value::as_array).and_then(|all| all.iter().find(|m| m.get("name").and_then(Value::as_str) == Some(SERVER)));
+            if ours.and_then(|m| m.get("status")).and_then(Value::as_str) == Some("failed") {
+                out.push(Msg::Event(Event::Text(CONNECTION_FAILED.into())));
+                out.push(Msg::Event(Event::Done));
+            }
+        }
         Some("assistant") => {
             let parts = v.pointer("/message/content").and_then(Value::as_array).cloned().unwrap_or_default();
             for part in parts {
@@ -430,6 +482,45 @@ mod tests {
         );
         assert_eq!(c.session.as_deref(), Some("s9"), "the next turn resumes this conversation");
         assert!(c.rx.is_none());
+    }
+
+    #[test]
+    fn a_failed_connection_ends_the_turn_with_why() {
+        let line = r#"{"type":"system","subtype":"init","session_id":"s2","mcp_servers":[{"name":"dalivinci","status":"failed"}]}"#;
+        let msgs = parse_line(line);
+        assert_eq!(msgs.first(), Some(&Msg::Session("s2".into())));
+        assert!(matches!(msgs.get(1), Some(Msg::Event(Event::Text(t))) if t.contains("connection to Dalivinci didn't")));
+        assert_eq!(msgs.last(), Some(&Msg::Event(Event::Done)));
+        // Connected, still starting, or someone else's server failing: carry on.
+        for status in [r#""connected""#, r#""pending""#] {
+            let ok = format!(
+                r#"{{"type":"system","subtype":"init","session_id":"s2","mcp_servers":[{{"name":"dalivinci","status":{status}}},{{"name":"other","status":"failed"}}]}}"#
+            );
+            assert_eq!(parse_line(&ok), [Msg::Session("s2".into())], "{status}");
+        }
+    }
+
+    #[test]
+    fn the_linux_claude_wins_over_windows_copies_seen_from_wsl() {
+        use std::path::{Path, PathBuf};
+        let have = |files: &'static [&'static str]| move |p: &Path| files.iter().any(|f| Path::new(f) == p);
+        let path = Some(std::ffi::OsString::from("/usr/bin:/mnt/c/Users/me/AppData/Roaming/npm:/home/me/bin"));
+        let home = Some(PathBuf::from("/home/me"));
+        // The Windows copy comes first on the PATH, but the Linux one is used.
+        let found = find_program(None, home.clone(), path.clone(), have(&["/mnt/c/Users/me/AppData/Roaming/npm/claude", "/home/me/bin/claude"]));
+        assert_eq!(found, Ok(PathBuf::from("/home/me/bin/claude")));
+        // The native installer's copy first.
+        let found = find_program(None, home.clone(), path.clone(), have(&["/home/me/.local/bin/claude", "/usr/bin/claude"]));
+        assert_eq!(found, Ok(PathBuf::from("/home/me/.local/bin/claude")));
+        // Only Windows' copy: say so, naming it.
+        let found = find_program(None, home.clone(), path.clone(), have(&["/mnt/c/Users/me/AppData/Roaming/npm/claude"]));
+        assert!(matches!(&found, Err(e) if e.contains("Only the Windows version") && e.contains("/mnt/c/Users/me/AppData/Roaming/npm/claude")), "{found:?}");
+        assert!(matches!(find_program(None, home.clone(), path.clone(), have(&["/home/me/bin/claude.exe"])), Err(e) if e.contains("Windows")));
+        // Nothing at all.
+        assert_eq!(find_program(None, home.clone(), path.clone(), have(&[])), Err(NOT_INSTALLED.into()));
+        // An explicit choice wins.
+        assert_eq!(find_program(Some("/opt/claude".into()), home, path, have(&[])), Ok(PathBuf::from("/opt/claude")));
+        assert!(!on_windows_side(Path::new("/mnt/data/claude")), "a mounted Linux disk isn't Windows");
     }
 
     #[test]

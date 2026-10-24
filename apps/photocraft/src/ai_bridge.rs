@@ -17,6 +17,7 @@ pub fn service(ctx: egui::Context) -> AiBridgeFn {
         if !cli.is_file() {
             return Err(format!("{} is missing: it ships next to the app", cli.display()));
         }
+        remove_stale_tokens(&dir);
         // A fresh token each launch: an old file is replaced, not reused.
         let token_file = dir.join(format!("bridge-{}.token", std::process::id()));
         let _ = std::fs::remove_file(&token_file);
@@ -29,4 +30,38 @@ pub fn service(ctx: egui::Context) -> AiBridgeFn {
             control,
         })
     })
+}
+
+/// Token files of earlier launches that have ended (Linux, where `/proc` says which are running).
+fn remove_stale_tokens(dir: &std::path::Path) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix("bridge-").and_then(|n| n.strip_suffix(".token")) else { continue };
+        if pid.parse::<u32>().is_ok() && !std::path::Path::new("/proc").join(pid).exists() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    #[test]
+    fn tokens_of_ended_launches_are_removed_and_running_ones_kept() {
+        let dir = std::env::temp_dir().join(format!("dalivinci-ai-tokens-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = dir.join(format!("bridge-{}.token", std::process::id()));
+        let ended = dir.join("bridge-4000000000.token");
+        let other = dir.join("notes.txt");
+        for f in [&mine, &ended, &other] {
+            std::fs::write(f, "x").unwrap();
+        }
+        super::remove_stale_tokens(&dir);
+        assert!(mine.exists() && other.exists());
+        assert!(!ended.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
