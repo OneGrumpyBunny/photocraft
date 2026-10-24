@@ -382,9 +382,12 @@ fn presets_store(app: &mut PhotocraftApp) {
 
 /// Resolve an absolute pixels-per-point preference without multiplying the OS DPI twice.
 /// Monitor dimensions are physical pixels, independent of window size and UI zoom.
-fn display_scale(pref: prefs::UiScale, native: Option<f32>) -> f32 {
+fn display_scale(pref: prefs::UiScale, native: Option<f32>, wsl: bool) -> f32 {
     let native = native.filter(|v| v.is_finite() && *v > 0.0).unwrap_or(1.0);
     match pref {
+        // Dalivinci: WSLg reports 100% whatever Windows' display scaling is, so the interface came
+        // out tiny on high-DPI screens. Auto starts at 150% there; a fixed choice still wins.
+        prefs::UiScale::Auto if wsl && native <= 1.0 => WSL_AUTO_SCALE,
         // The system's scale, fractional ones included (125%, 150%, 175%: #1072), and 100% on a
         // large 4K display run unscaled (#1278); 200% there is a fixed choice.
         prefs::UiScale::Auto => native,
@@ -392,10 +395,19 @@ fn display_scale(pref: prefs::UiScale, native: Option<f32>) -> f32 {
     }
 }
 
+/// Auto UI scale under WSL, where WSLg always reports 100% (see [`display_scale`]).
+const WSL_AUTO_SCALE: f32 = 1.5;
+
+/// Running under the Windows Subsystem for Linux (WSLg windows)? WSL sets `WSL_DISTRO_NAME`.
+fn under_wsl() -> bool {
+    static WSL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WSL.get_or_init(|| !cfg!(target_arch = "wasm32") && std::env::var_os("WSL_DISTRO_NAME").is_some_and(|v| !v.is_empty()))
+}
+
 fn sync_display_scale(app: &PhotocraftApp, ctx: &egui::Context) {
     let native = ctx.native_pixels_per_point();
     let native_scale = native.filter(|v| v.is_finite() && *v > 0.0).unwrap_or(1.0);
-    let scale = display_scale(app.session.prefs().interface.ui_scale, native);
+    let scale = display_scale(app.session.prefs().interface.ui_scale, native, under_wsl());
     ctx.set_zoom_factor(scale / native_scale);
 }
 
@@ -3157,11 +3169,23 @@ mod tests {
         // Whatever the monitor, 4K included: an unscaled desktop stays at 100% (#1278), and a
         // fractional or below-100% system scale is the user's choice (#1072).
         for dpi in [0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0] {
-            assert_eq!(display_scale(Auto, Some(dpi)), dpi);
+            assert_eq!(display_scale(Auto, Some(dpi), false), dpi);
         }
-        assert_eq!(display_scale(Auto, None), 1.0);
-        assert_eq!(display_scale(Auto, Some(f32::NAN)), 1.0);
-        assert_eq!(display_scale(Auto, Some(-2.0)), 1.0);
+        assert_eq!(display_scale(Auto, None, false), 1.0);
+        assert_eq!(display_scale(Auto, Some(f32::NAN), false), 1.0);
+        assert_eq!(display_scale(Auto, Some(-2.0), false), 1.0);
+    }
+
+    #[test]
+    fn auto_scale_under_wsl_starts_larger_but_a_fixed_choice_wins() {
+        use prefs::UiScale::{Auto, P100, P200};
+        // WSLg reports 100% whatever Windows uses, so Auto picks a readable size there.
+        assert_eq!(display_scale(Auto, Some(1.0), true), WSL_AUTO_SCALE);
+        assert_eq!(display_scale(Auto, None, true), WSL_AUTO_SCALE);
+        // A scale WSLg did pass through is kept, and an explicit choice always wins.
+        assert_eq!(display_scale(Auto, Some(2.0), true), 2.0);
+        assert_eq!(display_scale(P100, Some(1.0), true), 1.0);
+        assert_eq!(display_scale(P200, Some(1.0), true), 2.0);
     }
 
     #[test]

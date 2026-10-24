@@ -19,6 +19,7 @@ pub mod adjust_dialog;
 pub mod adjust_editors;
 pub mod adjust_preview;
 pub mod adjust_ui;
+pub mod ai_panel;
 mod alt_grab;
 pub mod analysis_ui;
 pub mod anchor_tools;
@@ -2062,6 +2063,10 @@ impl eframe::App for PhotocraftApp {
         }
         if chrome && self.ui.panels.dock {
             panels::right_dock(self, ui);
+        }
+        // Dalivinci: the AI Assistant, between the dock and the canvas.
+        if chrome {
+            ai_panel::side_panel(self, ui);
         }
         let t = theme::Tokens::get(&ctx);
         let backdrop = if chrome { prefs_ui::pasteboard_color(self).unwrap_or(t.canvas) } else { egui::Color32::BLACK };

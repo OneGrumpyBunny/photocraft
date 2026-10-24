@@ -1195,6 +1195,12 @@ pub struct UiState {
     #[serde(default)]
     pub analysis: crate::analysis_ui::AnalysisUi,
     pub timeline: crate::timeline_ui::TimelineUi,
+    /// Dalivinci: the AI Assistant panel (see `ai_panel`).
+    #[serde(default)]
+    pub ai: crate::ai_panel::AiPanelUi,
+    /// The UI clock (seconds) at the last frame, for AI turns started from automation.
+    #[serde(skip)]
+    pub ai_clock: f64,
     /// Slice and Slice Select tools (see `slice_ui`).
     #[serde(default)]
     pub slices: crate::slice_ui::SliceUi,
@@ -1344,6 +1350,8 @@ impl Default for UiState {
             type_panels: Default::default(),
             analysis: Default::default(),
             timeline: Default::default(),
+            ai: Default::default(),
+            ai_clock: 0.0,
             slices: Default::default(),
             frame_tool: Default::default(),
             artboard_tool: Default::default(),
