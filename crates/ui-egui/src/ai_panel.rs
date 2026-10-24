@@ -59,16 +59,20 @@ pub struct Message {
 pub enum Provider {
     #[default]
     Echo,
+    /// Claude Code, allowed to edit the open document.
     ClaudeCode,
+    /// Claude Code, only allowed to look.
+    ClaudeCodeLookOnly,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 2] = [Provider::Echo, Provider::ClaudeCode];
+    pub const ALL: [Provider; 3] = [Provider::Echo, Provider::ClaudeCode, Provider::ClaudeCodeLookOnly];
 
     pub fn label(self) -> &'static str {
         match self {
             Provider::Echo => "Echo (test AI)",
-            Provider::ClaudeCode => "Claude Code (read-only)",
+            Provider::ClaudeCode => "Claude Code",
+            Provider::ClaudeCodeLookOnly => "Claude Code (look only)",
         }
     }
 
@@ -76,9 +80,11 @@ impl Provider {
         match self {
             Provider::Echo => Box::new(Echo::default()),
             #[cfg(not(target_arch = "wasm32"))]
-            Provider::ClaudeCode => Box::new(crate::ai_claude::ClaudeCode::default()),
+            Provider::ClaudeCode => Box::new(crate::ai_claude::ClaudeCode::new(true)),
+            #[cfg(not(target_arch = "wasm32"))]
+            Provider::ClaudeCodeLookOnly => Box::new(crate::ai_claude::ClaudeCode::new(false)),
             #[cfg(target_arch = "wasm32")]
-            Provider::ClaudeCode => Box::new(Unavailable("Claude Code needs the desktop app.")),
+            Provider::ClaudeCode | Provider::ClaudeCodeLookOnly => Box::new(Unavailable("Claude Code needs the desktop app.")),
         }
     }
 }
@@ -93,6 +99,10 @@ pub struct Bridge {
     pub work_dir: std::path::PathBuf,
     /// Requests from the bridge, handled like the control server's.
     pub control: std::sync::mpsc::Receiver<ControlRequest>,
+    /// The desktop automation policy (no ambient file access, …), installed for the AI's requests
+    /// when the app wasn't started with `--control`, which installs it already.
+    pub authorize_command: crate::AutomationCommandFn,
+    pub authorize_step: fn(&str, &serde_json::Value) -> photocraft_engine::Result<()>,
 }
 
 /// The part of a [`Bridge`] an assistant keeps.
@@ -145,6 +155,8 @@ pub struct AiPanelUi {
     /// The bridge's link once it started (it starts on the first message to an AI that needs it).
     #[serde(skip)]
     link: Option<McpLink>,
+    #[serde(skip)]
+    turn_start: Option<TurnStart>,
 }
 
 impl PartialEq for AiPanelUi {
@@ -349,7 +361,59 @@ pub fn send(app: &mut PhotocraftApp, text: &str) -> Result<(), String> {
         app.ui.ai.link = Some(link);
     }
     let now = app.ui.ai_clock;
-    app.ui.ai.send(text, now)
+    let before = app.session.active().map(|d| d.doc.clone());
+    app.ui.ai.send(text, now)?;
+    app.ui.ai.turn_start = before.map(|doc| TurnStart { doc, label: step_label(text) });
+    Ok(())
+}
+
+/// The document as the AI's turn found it, so its edits can become one undo step.
+#[derive(Clone)]
+pub(crate) struct TurnStart {
+    doc: std::sync::Arc<photocraft_doc::Document>,
+    label: String,
+}
+
+impl std::fmt::Debug for TurnStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnStart").field("label", &self.label).finish_non_exhaustive()
+    }
+}
+
+/// History label for an AI turn: "AI: " and the start of what was asked.
+fn step_label(prompt: &str) -> String {
+    const MAX: usize = 40;
+    let words = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if words.chars().count() <= MAX {
+        return format!("AI: {words}");
+    }
+    let cut: String = words.chars().take(MAX).collect();
+    // Back to the last whole word.
+    let short = cut.rfind(' ').and_then(|at| cut.get(..at)).unwrap_or(&cut).trim_end_matches([',', '.', ';', ':']);
+    format!("AI: {short}\u{2026}")
+}
+
+/// Once a turn is over, fold the steps the AI added to the active document into one, so a single
+/// Ctrl+Z (or one History row) takes the whole turn back. Nothing is folded when the turn changed
+/// nothing, or when the document the turn started from is no longer in the history (the user
+/// undid past it, or the history limit dropped it).
+fn fold_turn(app: &mut PhotocraftApp) {
+    if app.ui.ai.busy {
+        return;
+    }
+    let Some(start) = app.ui.ai.turn_start.take() else { return };
+    let Some(st) = app.session.active_mut() else { return };
+    if std::sync::Arc::ptr_eq(&st.doc, &start.doc) {
+        return;
+    }
+    let past = st.history.past_len();
+    let Some(at) = (0..past).rev().find(|&i| st.history.state(i).is_some_and(|d| std::sync::Arc::ptr_eq(&d, &start.doc))) else { return };
+    for _ in at.saturating_add(1)..past {
+        st.history.purge_last();
+    }
+    st.history.set_current_label(start.label);
+    // The next edit is a step of its own, not a continuation of the AI's last one.
+    st.coalesce = None;
 }
 
 /// Start the private connection an AI program uses to reach this window.
@@ -358,6 +422,12 @@ fn connect_bridge(app: &mut PhotocraftApp) -> Result<McpLink, String> {
         return Err("this build of Dalivinci can't connect an AI program".into());
     };
     let bridge = start()?;
+    if app.services.automation_command.is_none() {
+        app.services.automation_command = Some(bridge.authorize_command);
+    }
+    if app.services.automation_authorize.is_none() {
+        app.services.automation_authorize = Some(bridge.authorize_step);
+    }
     // Started with `--control` too: both connections feed one queue.
     app.control_rx = Some(match app.control_rx.take() {
         None => bridge.control,
@@ -443,6 +513,7 @@ pub fn side_panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let now = ui.ctx().input(|i| i.time);
     app.ui.ai_clock = now;
     app.ui.ai.poll(now);
+    fold_turn(app);
     if app.ui.ai.busy {
         ui.ctx().request_repaint();
     }
@@ -659,6 +730,99 @@ mod tests {
         assert!(app.ui.ai.messages.is_empty());
         assert_eq!(menu(&mut app, "window.panel.timeline", &json!({})), None);
         assert_eq!(checked(&app, TOGGLE), Some(true));
+    }
+
+    #[test]
+    fn an_ai_turn_becomes_one_undo_step() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width": 16, "height": 16})).unwrap();
+        app.run("layer.new.layer", json!({"name": "Mine"})).unwrap();
+        let mine = app.session.active().unwrap().history.past_len();
+        // The AI's turn: three edits, then it's done.
+        app.ui.ai.turn_start =
+            app.session.active().map(|d| TurnStart { doc: d.doc.clone(), label: step_label("add  three\nlayers please, and make them nice and tidy for me") });
+        for name in ["A", "B", "C"] {
+            app.run("layer.new.layer", json!({"name": name})).unwrap();
+        }
+        assert_eq!(app.session.active().unwrap().history.past_len(), mine + 3);
+        fold_turn(&mut app);
+        let st = app.session.active().unwrap();
+        assert_eq!(st.history.past_len(), mine + 1, "one step for the whole turn");
+        assert_eq!(st.history.undo_label(), Some("AI: add three layers please, and make them\u{2026}"));
+        assert!(app.ui.ai.turn_start.is_none());
+        // One undo takes the whole turn back, keeping the user's own step.
+        app.run("edit.undo", json!({})).unwrap();
+        let names: Vec<String> = app.session.active().unwrap().doc.walk().iter().map(|(_, _, l)| l.name.clone()).collect();
+        assert!(names.iter().any(|n| n == "Mine") && !names.iter().any(|n| ["A", "B", "C"].contains(&n.as_str())), "{names:?}");
+    }
+
+    #[test]
+    fn a_turn_that_changed_nothing_or_was_undone_folds_nothing() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width": 16, "height": 16})).unwrap();
+        app.run("layer.new.layer", json!({})).unwrap();
+        let start = app.session.active().map(|d| TurnStart { doc: d.doc.clone(), label: "AI: x".into() });
+        app.ui.ai.turn_start = start.clone();
+        let before = app.session.active().unwrap().history.entries();
+        fold_turn(&mut app);
+        assert_eq!(app.session.active().unwrap().history.entries(), before, "nothing changed, nothing folded");
+        // The user undid past where the turn started: its document isn't in the history anymore.
+        app.ui.ai.turn_start = start;
+        app.run("edit.undo", json!({})).unwrap();
+        app.run("layer.new.layer", json!({})).unwrap();
+        let before = app.session.active().unwrap().history.entries();
+        fold_turn(&mut app);
+        assert_eq!(app.session.active().unwrap().history.entries(), before);
+        // Still answering: wait.
+        app.ui.ai.turn_start = app.session.active().map(|d| TurnStart { doc: d.doc.clone(), label: "AI: y".into() });
+        app.ui.ai.busy = true;
+        fold_turn(&mut app);
+        assert!(app.ui.ai.turn_start.is_some());
+    }
+
+    #[test]
+    fn connecting_the_ai_turns_the_automation_policy_on() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        assert!(app.services.automation_command.is_none(), "a plain launch has no policy");
+        fn deny_paths(id: &str, _: &Value) -> photocraft_engine::Result<()> {
+            if id == "layer.exportAs" { Err(photocraft_engine::EngineError::Other("no paths".into())) } else { Ok(()) }
+        }
+        app.services.ai_bridge = Some(Box::new(|| {
+            Ok(Bridge {
+                mcp_command: "photocraft-cli".into(),
+                mcp_args: vec!["mcp".into()],
+                work_dir: std::env::temp_dir(),
+                control: std::sync::mpsc::channel().1,
+                authorize_command: Box::new(|id, _| if id == "layer.exportAs" { Err("no paths".into()) } else { Ok(()) }),
+                authorize_step: deny_paths,
+            })
+        }));
+        let link = connect_bridge(&mut app).unwrap();
+        assert_eq!(link.args, ["mcp"]);
+        let authorize = app.services.automation_command.as_ref().unwrap();
+        assert!(authorize("layer.exportAs", &json!({"path": "/tmp/x.png"})).is_err());
+        assert!(authorize("layer.new.layer", &json!({})).is_ok());
+        assert!(app.services.automation_authorize.is_some());
+        assert!(app.control_rx.is_some(), "the bridge's requests are read");
+    }
+
+    #[test]
+    fn a_policy_from_control_launches_is_kept() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.services.automation_command = Some(Box::new(|_, _| Err("the --control policy".into())));
+        app.services.ai_bridge = Some(Box::new(|| {
+            Ok(Bridge {
+                mcp_command: "photocraft-cli".into(),
+                mcp_args: Vec::new(),
+                work_dir: std::env::temp_dir(),
+                control: std::sync::mpsc::channel().1,
+                authorize_command: Box::new(|_, _| Ok(())),
+                authorize_step: |_, _| Ok(()),
+            })
+        }));
+        connect_bridge(&mut app).unwrap();
+        let authorize = app.services.automation_command.as_ref().unwrap();
+        assert_eq!(authorize("anything", &json!({})), Err("the --control policy".to_string()));
     }
 
     #[test]

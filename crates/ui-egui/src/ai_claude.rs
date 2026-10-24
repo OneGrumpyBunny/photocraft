@@ -4,11 +4,14 @@
 //! (`claude -p … --output-format stream-json`), and reads its events line by line on a background
 //! thread. The conversation continues across turns with `--resume <session id>`.
 //!
-//! Claude reaches this window only through PhotoCraft's MCP server in bridge mode
-//! ([`McpLink`]), and for now only through its look-only tools: Claude Code's own tools are
-//! switched off (`--tools ""`, so no shell or file access), other MCP servers are ignored
-//! (`--strict-mcp-config`), the look-only tools are pre-approved and every other tool is refused
-//! without asking (`--permission-mode dontAsk`, plus an explicit deny list).
+//! Claude reaches this window only through PhotoCraft's MCP server in bridge mode ([`McpLink`]):
+//! Claude Code's own tools are switched off (`--tools ""`, so no shell or file access), other MCP
+//! servers are ignored (`--strict-mcp-config`), the bridge tools it may use are pre-approved and
+//! every other tool is refused without asking (`--permission-mode dontAsk`, plus an explicit deny
+//! list). It may always look; with editing on it may also run engine commands on the open
+//! document (`command_run`, `command_batch`), which the app's automation policy still screens (no
+//! file access). Opening, saving, exporting, switching documents and driving the pointer or menus
+//! stay refused.
 
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
@@ -26,8 +29,12 @@ const SERVER: &str = "dalivinci";
 const LOOK_TOOLS: [&str; 8] =
     ["session_list", "doc_inspect", "doc_render_preview", "render_preview", "command_list", "jobs_list", "ui_inspect", "ui_screenshot"];
 
-/// Tools that change the document, files or the window: refused for now.
-const CHANGE_TOOLS: [&str; 16] = [
+/// Tools that edit the open document: allowed when editing is on.
+const EDIT_TOOLS: [&str; 3] = ["command_run", "command_batch", "jobs_cancel"];
+
+/// Tools that open, save or export files, switch documents, or drive the pointer and menus:
+/// always refused.
+const CHANGE_TOOLS: [&str; 13] = [
     "doc_open",
     "doc_place",
     "doc_export_layers",
@@ -38,9 +45,6 @@ const CHANGE_TOOLS: [&str; 16] = [
     "doc_export",
     "doc_select",
     "doc_close",
-    "command_run",
-    "command_batch",
-    "jobs_cancel",
     "ui_pointer",
     "ui_menu_invoke",
     "ui_set",
@@ -48,12 +52,21 @@ const CHANGE_TOOLS: [&str; 16] = [
 /// Raw control-protocol calls: refused.
 const RAW_TOOLS: [&str; 1] = ["control_call"];
 
-const SYSTEM_PROMPT: &str = "You are the AI assistant inside Dalivinci, a fork of the PhotoCraft image editor, talking to \
-the user in a small side panel. You reach the open document only through the dalivinci tools. Use doc_inspect for the \
-layers and document state, ui_screenshot or doc_render_preview to see the image, ui_inspect for the tools and panels, \
-and command_list to find out which editing commands exist. In this version you can look but not change anything: \
-describe what you see, and when asked for an edit, explain which menu commands and settings the user can use to do it \
-themselves. Keep replies short and plain; the panel is narrow.";
+const ABOUT: &str = "You are the AI assistant inside Dalivinci, a fork of the PhotoCraft image editor, talking to the \
+user in a small side panel. You reach the open document only through the dalivinci tools. Use doc_inspect for the layers \
+and document state, ui_screenshot or doc_render_preview to see the image, ui_inspect for the tools and panels, and \
+command_list (with a filter) to find out which editing commands exist and what parameters they take. Keep replies short \
+and plain; the panel is narrow.";
+
+const LOOK_ONLY: &str = " In this mode you can look but not change anything: describe what you see, and when asked \
+for an edit, explain which menu commands and settings the user can use to do it themselves.";
+
+const CAN_EDIT: &str = " You can edit the open document with command_run and command_batch. Do what was asked and \
+nothing more. Prefer edits that keep the original pixels: adjustment layers, new layers, masks and layer styles over \
+changing the image layer directly. Look up a command's id and parameters with command_list before running it, and look \
+at the result afterwards. Everything you do in one reply becomes a single undo step, so the user can take it all back \
+with one Ctrl+Z; say so if they seem unhappy with the result. You cannot open, save or export files: when the work is \
+done, remind the user to save.";
 
 /// Shown instead of a reply when Claude Code couldn't start Dalivinci's helper.
 const CONNECTION_FAILED: &str = "Claude Code started, but its connection to Dalivinci didn't, so it can't see this window. \
@@ -72,6 +85,8 @@ enum Msg {
 
 #[derive(Default)]
 pub struct ClaudeCode {
+    /// May run engine commands on the open document, not only look.
+    can_edit: bool,
     link: Option<McpLink>,
     session: Option<String>,
     child: Option<Child>,
@@ -80,9 +95,17 @@ pub struct ClaudeCode {
     said: bool,
 }
 
+impl ClaudeCode {
+    pub fn new(can_edit: bool) -> Self {
+        let mut c = ClaudeCode::default();
+        c.can_edit = can_edit;
+        c
+    }
+}
+
 impl Assistant for ClaudeCode {
     fn name(&self) -> &'static str {
-        "Claude Code (read-only)"
+        if self.can_edit { "Claude Code" } else { "Claude Code (look only)" }
     }
 
     fn needs_bridge(&self) -> bool {
@@ -102,7 +125,7 @@ impl Assistant for ClaudeCode {
             fail(&tx, "Claude Code isn't connected to this window.".into());
             return;
         };
-        match spawn(&link, prompt, self.session.as_deref()) {
+        match spawn(&link, prompt, self.session.as_deref(), self.can_edit) {
             Ok(mut child) => {
                 read_output(&mut child, tx);
                 self.child = Some(child);
@@ -228,9 +251,15 @@ fn tool_list(tools: &[&str]) -> String {
 }
 
 /// The arguments for one turn.
-fn args(link: &McpLink, prompt: &str, session: Option<&str>) -> Vec<String> {
+fn args(link: &McpLink, prompt: &str, session: Option<&str>, can_edit: bool) -> Vec<String> {
+    let mut allow: Vec<&str> = LOOK_TOOLS.to_vec();
     let mut deny: Vec<&str> = CHANGE_TOOLS.to_vec();
     deny.extend(RAW_TOOLS);
+    if can_edit {
+        allow.extend(EDIT_TOOLS);
+    } else {
+        deny.extend(EDIT_TOOLS);
+    }
     let mut a = vec![
         "-p".to_owned(),
         prompt.to_owned(),
@@ -243,13 +272,13 @@ fn args(link: &McpLink, prompt: &str, session: Option<&str>) -> Vec<String> {
         "--mcp-config".into(),
         mcp_config(link),
         "--allowedTools".into(),
-        tool_list(&LOOK_TOOLS),
+        tool_list(&allow),
         "--disallowedTools".into(),
         tool_list(&deny),
         "--permission-mode".into(),
         "dontAsk".into(),
         "--append-system-prompt".into(),
-        SYSTEM_PROMPT.into(),
+        format!("{ABOUT}{}", if can_edit { CAN_EDIT } else { LOOK_ONLY }),
     ];
     if let Some(id) = session {
         a.extend(["--resume".into(), id.into()]);
@@ -257,12 +286,12 @@ fn args(link: &McpLink, prompt: &str, session: Option<&str>) -> Vec<String> {
     a
 }
 
-fn spawn(link: &McpLink, prompt: &str, session: Option<&str>) -> Result<Child, String> {
+fn spawn(link: &McpLink, prompt: &str, session: Option<&str>, can_edit: bool) -> Result<Child, String> {
     let _ = std::fs::create_dir_all(&link.work_dir);
     let log = debug_log(link);
     let _ = std::fs::remove_file(&log);
     Command::new(program()?)
-        .args(args(link, prompt, session))
+        .args(args(link, prompt, session, can_edit))
         .arg("--debug-file")
         .arg(&log)
         .current_dir(&link.work_dir)
@@ -350,7 +379,7 @@ fn parse_line(line: &str) -> Vec<Msg> {
                     }
                     Some("tool_use") => {
                         let name = part.get("name").and_then(Value::as_str).unwrap_or("a tool");
-                        out.push(Msg::Event(Event::Action(describe(name))));
+                        out.push(Msg::Event(Event::Action(describe(name, part.get("input")))));
                     }
                     _ => {}
                 }
@@ -371,9 +400,10 @@ fn parse_line(line: &str) -> Vec<Msg> {
     out
 }
 
-/// One action-log line for a tool Claude used.
-fn describe(tool: &str) -> String {
+/// One action-log line for a tool Claude used (`input` is its arguments).
+fn describe(tool: &str, input: Option<&Value>) -> String {
     let short = tool.strip_prefix(&format!("mcp__{SERVER}__")).unwrap_or(tool);
+    let id = |v: &Value| v.get("id").and_then(Value::as_str).map(str::to_owned);
     let what = match short {
         "session_list" => "Listed the open documents",
         "doc_inspect" => "Read the layers and document state",
@@ -382,6 +412,16 @@ fn describe(tool: &str) -> String {
         "ui_inspect" => "Read the tool and panel state",
         "command_list" => "Looked up the available commands",
         "jobs_list" => "Checked background jobs",
+        "jobs_cancel" => "Cancelled a background job",
+        "command_run" => return format!("Ran {}", input.and_then(id).unwrap_or_else(|| "a command".into())),
+        "command_batch" => {
+            let ids: Vec<String> = input.and_then(|i| i.get("steps")).and_then(Value::as_array).map(|s| s.iter().filter_map(id).collect()).unwrap_or_default();
+            return match ids.as_slice() {
+                [] => "Ran several commands".into(),
+                [one] => format!("Ran {one}"),
+                many => format!("Ran {} commands: {}", many.len(), many.join(", ")),
+            };
+        }
         _ => return format!("Tried {short}"),
     };
     format!("{what} ({short})")
@@ -404,36 +444,68 @@ mod tests {
         a.get(i + 1).unwrap()
     }
 
+    fn listed(list: &str, tool: &str) -> bool {
+        list.split(',').any(|x| x == format!("mcp__dalivinci__{tool}"))
+    }
+
     #[test]
-    fn a_turn_is_locked_down_to_looking() {
-        let a = args(&link(), "what's on the canvas?", None);
+    fn look_only_turns_are_locked_down_to_looking() {
+        let a = args(&link(), "what's on the canvas?", None, false);
         assert_eq!(a.get(..2).unwrap(), ["-p", "what's on the canvas?"]);
         assert_eq!(value_after(&a, "--tools"), "", "no shell or file tools");
         assert!(a.iter().any(|x| x == "--strict-mcp-config"));
         assert_eq!(value_after(&a, "--permission-mode"), "dontAsk");
-        let allowed = value_after(&a, "--allowedTools");
-        let denied = value_after(&a, "--disallowedTools");
+        let (allowed, denied) = (value_after(&a, "--allowedTools"), value_after(&a, "--disallowedTools"));
         for t in LOOK_TOOLS {
-            assert!(allowed.split(',').any(|x| x == format!("mcp__dalivinci__{t}")), "{t}");
+            assert!(listed(allowed, t) && !listed(denied, t), "{t}");
         }
-        for t in CHANGE_TOOLS.iter().chain(RAW_TOOLS.iter()) {
-            assert!(denied.split(',').any(|x| x == format!("mcp__dalivinci__{t}")), "{t}");
-            assert!(!allowed.contains(&format!("__{t},")) && !allowed.ends_with(&format!("__{t}")), "{t} must not be allowed");
+        for t in CHANGE_TOOLS.iter().chain(RAW_TOOLS.iter()).chain(EDIT_TOOLS.iter()) {
+            assert!(listed(denied, t) && !listed(allowed, t), "{t}");
         }
+        assert!(value_after(&a, "--append-system-prompt").contains("look but not change"));
         let config: Value = serde_json::from_str(value_after(&a, "--mcp-config")).unwrap();
         assert_eq!(config["mcpServers"]["dalivinci"]["args"][2], "127.0.0.1:4321");
         assert!(!a.iter().any(|x| x == "--resume"));
-        let next = args(&link(), "and now?", Some("abc-123"));
+        let next = args(&link(), "and now?", Some("abc-123"), false);
         assert_eq!(value_after(&next, "--resume"), "abc-123");
     }
 
     #[test]
+    fn editing_turns_may_run_commands_but_never_touch_files() {
+        let a = args(&link(), "add a vignette", None, true);
+        assert_eq!(value_after(&a, "--tools"), "");
+        assert_eq!(value_after(&a, "--permission-mode"), "dontAsk");
+        let (allowed, denied) = (value_after(&a, "--allowedTools"), value_after(&a, "--disallowedTools"));
+        for t in LOOK_TOOLS.iter().chain(EDIT_TOOLS.iter()) {
+            assert!(listed(allowed, t) && !listed(denied, t), "{t}");
+        }
+        for t in ["doc_save", "doc_export", "doc_open", "doc_place", "doc_close", "ui_pointer", "ui_menu_invoke", "control_call"] {
+            assert!(listed(denied, t) && !listed(allowed, t), "{t}");
+        }
+        assert!(value_after(&a, "--append-system-prompt").contains("single undo step"));
+        assert_eq!(ClaudeCode::new(true).name(), "Claude Code");
+        assert_eq!(ClaudeCode::new(false).name(), "Claude Code (look only)");
+    }
+
+    #[test]
     fn every_bridge_tool_is_either_allowed_or_denied() {
-        let names: Vec<&str> = LOOK_TOOLS.iter().chain(CHANGE_TOOLS.iter()).chain(RAW_TOOLS.iter()).copied().collect();
+        let names: Vec<&str> = LOOK_TOOLS.iter().chain(EDIT_TOOLS.iter()).chain(CHANGE_TOOLS.iter()).chain(RAW_TOOLS.iter()).copied().collect();
         let mut sorted = names.clone();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), names.len(), "no tool is in two lists");
+    }
+
+    #[test]
+    fn edits_are_described_by_command() {
+        assert_eq!(
+            describe("mcp__dalivinci__command_run", Some(&serde_json::json!({"id": "layer.newAdjustmentLayer.curves"}))),
+            "Ran layer.newAdjustmentLayer.curves"
+        );
+        let batch = serde_json::json!({"steps": [{"id": "layer.new.layer"}, {"id": "edit.fill"}]});
+        assert_eq!(describe("mcp__dalivinci__command_batch", Some(&batch)), "Ran 2 commands: layer.new.layer, edit.fill");
+        assert_eq!(describe("mcp__dalivinci__command_run", None), "Ran a command");
+        assert_eq!(describe("mcp__dalivinci__doc_save", None), "Tried doc_save");
     }
 
     #[test]
@@ -457,7 +529,6 @@ mod tests {
         assert!(parse_line(r#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#).is_empty());
         assert!(parse_line("not json").is_empty());
         assert!(parse_line(r#"{"type":"assistant","message":{"content":"oops"}}"#).is_empty());
-        assert_eq!(describe("mcp__dalivinci__command_run"), "Tried command_run");
     }
 
     #[test]

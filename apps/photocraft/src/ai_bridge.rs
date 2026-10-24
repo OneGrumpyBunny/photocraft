@@ -28,6 +28,11 @@ pub fn service(ctx: egui::Context) -> AiBridgeFn {
             mcp_args: vec!["mcp".into(), "--bridge".into(), format!("127.0.0.1:{port}"), "--control-token-file".into(), token_file.display().to_string()],
             work_dir: dir.join("workdir"),
             control,
+            // The same policy `--control` installs: no ambient file access through commands.
+            authorize_command: Box::new(|id: &str, params: &serde_json::Value| {
+                photocraft_automation::workspace::authorize_desktop_engine_command(id, params).map_err(|e| e.to_string())
+            }),
+            authorize_step: photocraft_automation::workspace::authorize_desktop_engine_step,
         })
     })
 }
