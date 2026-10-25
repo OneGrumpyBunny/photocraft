@@ -10,6 +10,7 @@ Status of the AI side panel on the `ai-panel` branch of this fork.
 - [x] M4: Claude Code edits, one undo step per reply
 - [x] M5: Ollama and Gemini, Local only mode
 - [x] Model list closes after a pick; Gemini default `gemini-3.8-flash`; busy retry
+- [x] Claude Code Model box (pinned `--model`); model reasoning hidden from the chat
 - [x] Tested by the user: Claude Code edit, Ollama (qwen3-vl:30b) describe and edit,
       Gemini describe
 
@@ -27,9 +28,11 @@ and SDXL base. No inpainting model yet.
 - [x] Local only allows ComfyUI on this computer or the local network only
 - [x] Chat AIs: `command_run` `ai.picture` (waits for the result), `ai.picture.status`
 - [x] Tests against a stand-in ComfyUI, and in the running app
-- [ ] User test against the real ComfyUI; confirm the int8 Z-Image file loads with the
-      standard UNETLoader (if not, use the user's exported API workflow)
-- [ ] Maybe: an inpainting model for better blending; steps/size options
+- [x] User test against the real ComfyUI: List, Create and Change work (Z-Image bf16)
+- [x] Repaint blends at the edges (feathered mask, Differential Diffusion)
+- [ ] Repaint fits its surroundings: whole picture as context when small; support an
+      inpainting checkpoint (e.g. SDXL Inpainting 0.1) with InpaintModelConditioning
+- [ ] Maybe: steps/size options
 
 ## Later
 
