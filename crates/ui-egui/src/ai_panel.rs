@@ -98,9 +98,10 @@ impl Provider {
         match self {
             Provider::Echo => Box::new(Echo::default()),
             #[cfg(not(target_arch = "wasm32"))]
-            Provider::ClaudeCode => Box::new(crate::ai_claude::ClaudeCode::new(true)),
-            #[cfg(not(target_arch = "wasm32"))]
-            Provider::ClaudeCodeLookOnly => Box::new(crate::ai_claude::ClaudeCode::new(false)),
+            Provider::ClaudeCode | Provider::ClaudeCodeLookOnly => match crate::ai_claude::model_arg(&settings.claude_model) {
+                Ok(model) => Box::new(crate::ai_claude::ClaudeCode::new(self == Provider::ClaudeCode, model)),
+                Err(e) => Box::new(Unavailable(e.into())),
+            },
             #[cfg(not(target_arch = "wasm32"))]
             Provider::Ollama => Box::new(OpenAiCompatible::new(
                 ServiceConfig { label: "Ollama", base_url: settings.ollama_url.clone(), model: settings.ollama_model.clone(), api_key: None },
@@ -117,10 +118,10 @@ impl Provider {
                     },
                     true,
                 )),
-                None => Box::new(Unavailable("Gemini needs an API key: paste it under Connection above (get one free at aistudio.google.com).")),
+                None => Box::new(Unavailable("Gemini needs an API key: paste it under Connection above (get one free at aistudio.google.com).".into())),
             },
             #[cfg(target_arch = "wasm32")]
-            _ => Box::new(Unavailable("This AI needs the desktop app.")),
+            _ => Box::new(Unavailable("This AI needs the desktop app.".into())),
         }
     }
 }
@@ -134,6 +135,9 @@ pub struct AiSettings {
     pub gemini_model: String,
     /// Gemini's API address (its OpenAI-compatible endpoint), changeable for a proxy.
     pub gemini_url: String,
+    /// The model Claude Code runs (its `--model`), so it stays the same when Claude Code updates.
+    /// Empty: Claude Code's own default.
+    pub claude_model: String,
 }
 
 impl Default for AiSettings {
@@ -143,6 +147,7 @@ impl Default for AiSettings {
             ollama_model: "qwen3-vl:30b".into(),
             gemini_model: "gemini-3.8-flash".into(),
             gemini_url: GEMINI_URL.into(),
+            claude_model: String::new(),
         }
     }
 }
@@ -382,7 +387,7 @@ impl Assistant for Echo {
 }
 
 /// An AI that can't run (not on this build, or not set up): every turn answers with why.
-struct Unavailable(&'static str);
+struct Unavailable(std::borrow::Cow<'static, str>);
 
 impl Assistant for Unavailable {
     fn name(&self) -> &'static str {
@@ -390,7 +395,7 @@ impl Assistant for Unavailable {
     }
     fn start(&mut self, _prompt: &str, _now: f64) {}
     fn poll(&mut self, _now: f64) -> Vec<Event> {
-        vec![Event::Text(self.0.into()), Event::Done]
+        vec![Event::Text(self.0.to_string()), Event::Done]
     }
     fn stop(&mut self) {}
 }
@@ -759,6 +764,8 @@ fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, t: &Tokens) {
     #[cfg(not(target_arch = "wasm32"))]
     if matches!(ai.provider, Provider::Ollama | Provider::Gemini) {
         connection(app, ui, t);
+    } else if matches!(ai.provider, Provider::ClaudeCode | Provider::ClaudeCodeLookOnly) {
+        claude_connection(app, ui, t);
     }
     #[cfg(not(target_arch = "wasm32"))]
     crate::ai_pictures::section(app, ui, t);
@@ -834,6 +841,29 @@ fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, t: &Tokens) {
             message(ui, t, m);
         }
     });
+}
+
+/// The Connection section for Claude Code: the model it runs.
+#[cfg(not(target_arch = "wasm32"))]
+fn claude_connection(app: &mut PhotocraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    let ai = &mut app.ui.ai;
+    let mut changed = false;
+    egui::CollapsingHeader::new(RichText::new("Connection").small().color(t.text_dim)).id_salt("ai_claude_connection").show(ui, |ui| {
+        ui.label(RichText::new("Model").small().color(t.text_dim));
+        changed = ui
+            .add(egui::TextEdit::singleline(&mut ai.settings.claude_model).hint_text("Claude Code's default").desired_width(f32::INFINITY))
+            .on_hover_text("A model id such as claude-sonnet-5-5 keeps Claude on that model when Claude Code updates. Empty uses Claude Code's own default.")
+            .lost_focus();
+        let note = if ai.settings.claude_model.trim().is_empty() {
+            "Not pinned: follows Claude Code's default model."
+        } else {
+            "Pinned: every message uses this model."
+        };
+        ui.label(RichText::new(note).small().color(t.text_dim));
+    });
+    if changed {
+        ai.reconfigure();
+    }
 }
 
 /// The Connection section for Ollama and Gemini: address, model (with the service's list), and

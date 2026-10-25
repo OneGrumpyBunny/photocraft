@@ -42,6 +42,8 @@ enum Msg {
 pub struct ClaudeCode {
     /// May run engine commands on the open document, not only look.
     can_edit: bool,
+    /// The `--model` to run; None for Claude Code's default.
+    model: Option<String>,
     link: Option<McpLink>,
     session: Option<String>,
     child: Option<Child>,
@@ -51,10 +53,26 @@ pub struct ClaudeCode {
 }
 
 impl ClaudeCode {
-    pub fn new(can_edit: bool) -> Self {
+    pub fn new(can_edit: bool, model: Option<String>) -> Self {
         let mut c = ClaudeCode::default();
         c.can_edit = can_edit;
+        c.model = model;
         c
+    }
+}
+
+/// The Model box as a `--model` value: None when empty; refused unless it looks like a model id
+/// or alias (it goes on Claude Code's command line).
+pub fn model_arg(model: &str) -> Result<Option<String>, String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Ok(None);
+    }
+    let ok = !model.starts_with('-') && model.len() <= 100 && model.chars().all(|c| c.is_ascii_alphanumeric() || "-._:[]@".contains(c));
+    if ok {
+        Ok(Some(model.to_owned()))
+    } else {
+        Err(format!("\u{201c}{model}\u{201d} isn't a Claude model id (such as claude-sonnet-5-5): check Connection \u{203a} Model."))
     }
 }
 
@@ -80,7 +98,7 @@ impl Assistant for ClaudeCode {
             fail(&tx, "Claude Code isn't connected to this window.".into());
             return;
         };
-        match spawn(&link, prompt, self.session.as_deref(), self.can_edit) {
+        match spawn(&link, prompt, self.session.as_deref(), self.can_edit, self.model.as_deref()) {
             Ok(mut child) => {
                 read_output(&mut child, tx);
                 self.child = Some(child);
@@ -206,7 +224,7 @@ fn tool_list(tools: &[&str]) -> String {
 }
 
 /// The arguments for one turn.
-fn args(link: &McpLink, prompt: &str, session: Option<&str>, can_edit: bool) -> Vec<String> {
+fn args(link: &McpLink, prompt: &str, session: Option<&str>, can_edit: bool, model: Option<&str>) -> Vec<String> {
     let mut allow: Vec<&str> = LOOK_TOOLS.to_vec();
     let mut deny: Vec<&str> = CHANGE_TOOLS.to_vec();
     deny.extend(RAW_TOOLS);
@@ -238,15 +256,18 @@ fn args(link: &McpLink, prompt: &str, session: Option<&str>, can_edit: bool) -> 
     if let Some(id) = session {
         a.extend(["--resume".into(), id.into()]);
     }
+    if let Some(model) = model {
+        a.extend(["--model".into(), model.into()]);
+    }
     a
 }
 
-fn spawn(link: &McpLink, prompt: &str, session: Option<&str>, can_edit: bool) -> Result<Child, String> {
+fn spawn(link: &McpLink, prompt: &str, session: Option<&str>, can_edit: bool, model: Option<&str>) -> Result<Child, String> {
     let _ = std::fs::create_dir_all(&link.work_dir);
     let log = debug_log(link);
     let _ = std::fs::remove_file(&log);
     Command::new(program()?)
-        .args(args(link, prompt, session, can_edit))
+        .args(args(link, prompt, session, can_edit, model))
         .arg("--debug-file")
         .arg(&log)
         .current_dir(&link.work_dir)
@@ -359,6 +380,15 @@ fn parse_line(line: &str) -> Vec<Msg> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_model_box_takes_ids_and_aliases_only() {
+        assert_eq!(model_arg("  "), Ok(None));
+        assert_eq!(model_arg(" claude-sonnet-5-5 "), Ok(Some("claude-sonnet-5-5".into())));
+        assert_eq!(model_arg("opus"), Ok(Some("opus".into())));
+        assert!(model_arg("--dangerously-skip-permissions").is_err());
+        assert!(model_arg("sonnet; rm -rf ~").is_err());
+    }
+
     fn link() -> McpLink {
         McpLink {
             command: "/opt/dalivinci/photocraft-cli".into(),
@@ -378,7 +408,7 @@ mod tests {
 
     #[test]
     fn look_only_turns_are_locked_down_to_looking() {
-        let a = args(&link(), "what's on the canvas?", None, false);
+        let a = args(&link(), "what's on the canvas?", None, false, None);
         assert_eq!(a.get(..2).unwrap(), ["-p", "what's on the canvas?"]);
         assert_eq!(value_after(&a, "--tools"), "", "no shell or file tools");
         assert!(a.iter().any(|x| x == "--strict-mcp-config"));
@@ -394,13 +424,16 @@ mod tests {
         let config: Value = serde_json::from_str(value_after(&a, "--mcp-config")).unwrap();
         assert_eq!(config["mcpServers"]["dalivinci"]["args"][2], "127.0.0.1:4321");
         assert!(!a.iter().any(|x| x == "--resume"));
-        let next = args(&link(), "and now?", Some("abc-123"), false);
+        assert!(!a.iter().any(|x| x == "--model"), "no model unless one is set");
+        let pinned = args(&link(), "hi", None, true, Some("claude-sonnet-5-5"));
+        assert_eq!(value_after(&pinned, "--model"), "claude-sonnet-5-5");
+        let next = args(&link(), "and now?", Some("abc-123"), false, None);
         assert_eq!(value_after(&next, "--resume"), "abc-123");
     }
 
     #[test]
     fn editing_turns_may_run_commands_but_never_touch_files() {
-        let a = args(&link(), "add a vignette", None, true);
+        let a = args(&link(), "add a vignette", None, true, None);
         assert_eq!(value_after(&a, "--tools"), "");
         assert_eq!(value_after(&a, "--permission-mode"), "dontAsk");
         let (allowed, denied) = (value_after(&a, "--allowedTools"), value_after(&a, "--disallowedTools"));
@@ -411,8 +444,8 @@ mod tests {
             assert!(listed(denied, t) && !listed(allowed, t), "{t}");
         }
         assert!(value_after(&a, "--append-system-prompt").contains("single undo step"));
-        assert_eq!(ClaudeCode::new(true).name(), "Claude Code");
-        assert_eq!(ClaudeCode::new(false).name(), "Claude Code (look only)");
+        assert_eq!(ClaudeCode::new(true, None).name(), "Claude Code");
+        assert_eq!(ClaudeCode::new(false, None).name(), "Claude Code (look only)");
     }
 
     #[test]
