@@ -474,7 +474,7 @@ pub fn start(app: &mut PhotocraftApp, mode: Mode, prompt: &str, ctx: Option<&egu
         return Err(format!("{} isn't on this computer or its local network: turn off Local only to use it.", settings.comfy_url));
     }
     if settings.model.is_empty() {
-        return Err("Pick a model first (Connection › List).".into());
+        return Err("Pick a picture model first: click List next to the ComfyUI address.".into());
     }
     let doc_index = app.session.active_index().ok_or("Open or create a document first.")?;
     let doc = app.session.active().map(|d| d.doc.clone()).ok_or("Open or create a document first.")?;
