@@ -143,7 +143,7 @@ struct Job {
     /// The document it was made for (its index in the session), and the area the result covers.
     doc_index: usize,
     region: Rect,
-    /// The selection when the request started: a repaint's layer mask.
+    /// A repaint's layer mask: the selection when the request started, feathered, over `region`.
     selection: Option<Surface>,
     stop: Arc<AtomicBool>,
     rx: Receiver<Result<Made, String>>,
@@ -372,6 +372,15 @@ fn png(width: u32, height: u32, rgba: Vec<u8>) -> Result<Vec<u8>, String> {
     photocraft_codecs::encode(&image, photocraft_codecs::Format::Png, &Default::default()).map_err(|e| e.to_string())
 }
 
+/// The selection over `region` as 8-bit gray, feathered by about 5% of the selection's smaller
+/// side (4–48 px).
+fn soft_mask(selection: &Surface, region: Rect, sel_bounds: Rect) -> Vec<u8> {
+    let (w, h) = (region.width() as usize, region.height() as usize);
+    let hard = photocraft_algo::selection::mask_from_surface(Some(selection), region);
+    let radius = (sel_bounds.width().min(sel_bounds.height()) as f32 * 0.05).clamp(4.0, 48.0);
+    photocraft_algo::selection::feather(&hard, w, h, radius).iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect()
+}
+
 /// The ComfyUI workflow for a request. `source` and `mask` are uploaded file names.
 pub fn workflow(settings: &PictureSettings, mode: Mode, prompt: &str, size: (u32, u32), seed: u64, source: Option<&str>, mask: Option<&str>) -> Value {
     let mut g = serde_json::Map::new();
@@ -379,7 +388,7 @@ pub fn workflow(settings: &PictureSettings, mode: Mode, prompt: &str, size: (u32
         g.insert(id.into(), json!({ "class_type": class, "inputs": inputs }));
     };
     let link = |id: &str, out: u32| json!([id, out]);
-    let (model, clip, vae, positive, negative, steps, cfg, sampler, scheduler);
+    let (mut model, clip, vae, positive, negative, steps, cfg, sampler, scheduler);
     match settings.family {
         Family::Diffusion => {
             node("1", "UNETLoader", json!({ "unet_name": settings.model, "weight_dtype": "default" }));
@@ -414,6 +423,10 @@ pub fn workflow(settings: &PictureSettings, mode: Mode, prompt: &str, size: (u32
                 (Mode::Repaint, Some(mask)) => {
                     node("11", "LoadImageMask", json!({ "image": mask, "channel": "red" }));
                     node("12", "SetLatentNoiseMask", json!({ "samples": link("7", 0), "mask": link("11", 0) }));
+                    // Differential Diffusion reads the soft mask as how much each pixel may change,
+                    // so the repaint blends into the picture instead of ending at a hard edge.
+                    node("13", "DifferentialDiffusion", json!({ "model": model }));
+                    model = link("13", 0);
                     (link("12", 0), strength)
                 }
                 _ => (link("7", 0), strength),
@@ -490,13 +503,18 @@ pub fn start(app: &mut PhotocraftApp, mode: Mode, prompt: &str, ctx: Option<&egu
         let flat = photocraft_compose::render(&doc, region).to_rgba8();
         Some(png(size.0, size.1, resize(&flat.pixels, flat.width, flat.height, size.0, size.1, PixelFormat::RGBA8))?)
     };
-    let mask = match (&selection, mode) {
-        (Some(sel), Mode::Repaint) => {
-            let gray = sel.convert(PixelFormat::GRAY8).to_interleaved(region);
-            let small = resize(&gray, region.width(), region.height(), size.0, size.1, PixelFormat::GRAY8);
+    // A repaint's mask is the selection with soft edges: the model changes the middle fully and
+    // less towards the edges, and the layer mask fades the same way, so there's no seam.
+    let soft = match (&selection, mode) {
+        (Some(sel), Mode::Repaint) => Some(soft_mask(sel, region, sel_bounds.unwrap_or(region))),
+        _ => None,
+    };
+    let mask = match &soft {
+        Some(gray) => {
+            let small = resize(gray, region.width(), region.height(), size.0, size.1, PixelFormat::GRAY8);
             Some(png(size.0, size.1, small.iter().flat_map(|&v| [v, v, v, 255]).collect())?)
         }
-        _ => None,
+        None => None,
     };
     let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64 & 0xffff_ffff_ffff);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -523,8 +541,15 @@ pub fn start(app: &mut PhotocraftApp, mode: Mode, prompt: &str, ctx: Option<&egu
     });
     let pictures = &mut app.ui.ai.pictures;
     pictures.note = None;
-    pictures.job =
-        Some(Job { mode, label: crate::ai_panel::step_label(prompt), doc_index, region, selection: selection.filter(|_| mode == Mode::Repaint), stop, rx });
+    pictures.job = Some(Job {
+        mode,
+        label: crate::ai_panel::step_label(prompt),
+        doc_index,
+        region,
+        selection: soft.map(|gray| Surface::from_interleaved(PixelFormat::GRAY8, region, &gray)),
+        stop,
+        rx,
+    });
     Ok(())
 }
 
@@ -746,6 +771,9 @@ mod tests {
         assert_eq!(g["10"]["inputs"]["image"], "src.png");
         assert_eq!(g["11"]["inputs"]["image"], "mask.png");
         assert_eq!(g["8"]["inputs"]["latent_image"], json!(["12", 0]));
+        assert_eq!(g["13"]["class_type"], "DifferentialDiffusion");
+        assert_eq!(g["13"]["inputs"]["model"], json!(["4", 0]));
+        assert_eq!(g["8"]["inputs"]["model"], json!(["13", 0]), "the repaint samples through Differential Diffusion");
         assert_eq!(g["8"]["inputs"]["denoise"], 0.5);
         let sdxl = PictureSettings { model: "sd_xl_base_1.0.safetensors".into(), ..Default::default() };
         let g = workflow(&sdxl, Mode::Change, "oil painting", (1024, 1024), 7, Some("src.png"), None);
@@ -805,12 +833,14 @@ mod tests {
         let layer = st.doc.layer(st.active_layer.unwrap()).unwrap();
         assert_eq!(layer.name, "AI: a red square");
         let mask = layer.mask.as_ref().expect("a repaint is masked to the selection");
-        assert!(mask.surface.sample_channel(30, 20, 0) > 0.99 && mask.surface.sample_channel(150, 80, 0) < 0.01);
+        let m = |x, y| mask.surface.sample_channel(x, y, 0);
+        assert!(m(40, 25) > 0.95 && m(150, 80) < 0.01, "inside and far outside");
+        assert!(m(20, 25) > 0.2 && m(20, 25) < 0.8, "a soft edge, not a hard one: {}", m(20, 25));
         assert!(st.doc.selection.is_some(), "the selection stays, to try again");
         // The picture covers the region around the selection (the whole small canvas here) and is red.
         let flat = photocraft_compose::flatten(&st.doc).to_rgba8();
         let at = |x: usize, y: usize| &flat.pixels[(y * 200 + x) * 4..][..3];
-        assert_eq!(at(30, 20), [255, 0, 0]);
+        assert!(at(40, 25)[0] > 240 && at(40, 25)[1] < 20, "{:?}", at(40, 25));
         assert_ne!(at(150, 80), [255, 0, 0], "outside the selection nothing changed");
         app.run("edit.undo", json!({})).unwrap();
         assert_eq!(app.session.active().unwrap().doc.layer_count(), layers, "one undo takes it back");
