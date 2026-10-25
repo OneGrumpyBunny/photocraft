@@ -13,25 +13,23 @@ Status of the AI side panel on the `ai-panel` branch of this fork.
 - [x] Tested by the user: Claude Code edit, Ollama (qwen3-vl:30b) describe and edit,
       Gemini describe
 
-## Next: Stable Diffusion (ComfyUI)
+## M6: Pictures from ComfyUI
 
-The user runs ComfyUI on another machine on their network (address kept out of this
-public repo; ComfyUI's default port is 8188).
+The user runs ComfyUI 0.41 on another machine on their network (address kept out of this
+public repo). Models there: Z-Image Turbo (int8) with Qwen3 4B text encoder and `ae` VAE,
+and SDXL base. No inpainting model yet.
 
-- [ ] Confirm the setup: ComfyUI version, which checkpoint(s) and an inpainting model,
-      and that WSL can reach the machine (`curl http://<address>:8188/system_stats`)
-- [ ] Confirm ComfyUI listens on the network (`--listen`) and decide whether the
-      network is trusted (ComfyUI has no authentication)
-- [ ] Decide the use: a direct Generate box, a tool the chat AIs can call, or both
-- [ ] Connection settings: ComfyUI address, checkpoint, steps/strength defaults
-- [ ] Client: upload image and mask (`/upload/image`), queue a workflow (`/prompt`),
-      wait for it (`/history` or the websocket), fetch the result (`/view`)
-- [ ] Workflows: text-to-image, image-to-image, inpaint the selection (selection as the mask)
-- [ ] Result goes in as a new layer above the source, aligned to the selection, one undo step
-- [ ] Counts as local for Local only only when the address is on the user's own network;
-      say so in the panel
-- [ ] Tool for chat AIs (for example `image_generate`) with prompt, strength, selection only
-- [ ] Tests against a mock ComfyUI server; end-to-end test by the user
+- [x] Reachable from WSL; firewall allows the LAN on ComfyUI's port
+- [x] Client: list models, upload image and mask, queue a workflow, wait, fetch the result
+- [x] Workflows for Z-Image-style diffusion models and SDXL-style checkpoints:
+      create, change the whole image, repaint the selection
+- [x] Result as a new layer in one undo step, masked to the selection for a repaint
+- [x] Local only allows ComfyUI on this computer or the local network only
+- [x] Chat AIs: `command_run` `ai.picture` (waits for the result), `ai.picture.status`
+- [x] Tests against a stand-in ComfyUI, and in the running app
+- [ ] User test against the real ComfyUI; confirm the int8 Z-Image file loads with the
+      standard UNETLoader (if not, use the user's exported API workflow)
+- [ ] Maybe: an inpainting model for better blending; steps/size options
 
 ## Later
 

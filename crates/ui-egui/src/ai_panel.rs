@@ -617,7 +617,10 @@ pub(crate) fn merge(a: std::sync::mpsc::Receiver<ControlRequest>, b: std::sync::
 
 /// Ids this module owns.
 pub fn handles(id: &str) -> bool {
-    matches!(id, TOGGLE | SEND | STOP | CLEAR | PROVIDER | SETTINGS | crate::ai_pictures::PICTURE | crate::ai_pictures::STATUS)
+    matches!(
+        id,
+        TOGGLE | SEND | STOP | CLEAR | PROVIDER | SETTINGS | crate::ai_pictures::PICTURE | crate::ai_pictures::STATUS | crate::ai_pictures::PICTURE_SETTINGS
+    )
 }
 
 /// Menu checkmark for Window › AI Assistant.

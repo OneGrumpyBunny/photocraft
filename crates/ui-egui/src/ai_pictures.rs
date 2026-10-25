@@ -25,6 +25,9 @@ use crate::PhotocraftApp;
 pub const PICTURE: &str = "ai.picture";
 /// Whether a picture is still being made; over the control channel, waits for it like [`PICTURE`].
 pub const STATUS: &str = "ai.picture.status";
+/// Change the Pictures settings (`comfyUrl`, `model`, `family`, `textEncoder`, `vae`,
+/// `strength`); `{"list": true}` asks ComfyUI for its models and fills in missing choices.
+pub const PICTURE_SETTINGS: &str = "ai.picture.settings";
 /// How long a control request waits for a picture before answering that it's still coming
 /// (below the bridge's 55-second call timeout).
 const REPLY_WAIT: Duration = Duration::from_secs(45);
@@ -181,7 +184,7 @@ impl PartialEq for PicturesUi {
 
 impl Serialize for PicturesUi {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        json!({ "settings": self.settings, "mode": self.mode, "busy": self.job.is_some() }).serialize(s)
+        json!({ "settings": self.settings, "mode": self.mode, "busy": self.job.is_some(), "note": self.note, "models": self.catalog.models.iter().map(|m| &m.file).collect::<Vec<_>>() }).serialize(s)
     }
 }
 
@@ -201,6 +204,11 @@ impl<'de> Deserialize<'de> for PicturesUi {
 impl PicturesUi {
     pub fn busy(&self) -> bool {
         self.job.is_some()
+    }
+
+    /// Asking ComfyUI for its models.
+    pub fn listing(&self) -> bool {
+        self.catalog_rx.is_some()
     }
 
     pub fn stop(&mut self) {
@@ -249,6 +257,27 @@ impl PicturesUi {
 pub fn menu(app: &mut PhotocraftApp, id: &str, params: &Value) -> Option<Result<Value, String>> {
     match id {
         STATUS => Some(Ok(json!({ "busy": app.ui.ai.pictures.busy(), "note": app.ui.ai.pictures.note }))),
+        PICTURE_SETTINGS => Some((|| {
+            // An AI could point ComfyUI somewhere else and send the user's pictures there.
+            if app.ui.ai.busy {
+                return Err("Not while the AI is answering.".to_owned());
+            }
+            let pictures = &mut app.ui.ai.pictures;
+            let mut merged = serde_json::to_value(&pictures.settings).unwrap_or_default();
+            if let (Some(m), Some(changes)) = (merged.as_object_mut(), params.as_object()) {
+                for (k, v) in changes {
+                    if m.contains_key(k) {
+                        m.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            pictures.settings = serde_json::from_value(merged).map_err(|e| format!("{PICTURE_SETTINGS}: {e}"))?;
+            #[cfg(not(target_arch = "wasm32"))]
+            if params.get("list").and_then(Value::as_bool) == Some(true) {
+                list_models(app, None);
+            }
+            serde_json::to_value(&app.ui.ai.pictures.settings).map_err(|e| e.to_string())
+        })()),
         PICTURE => Some((|| {
             let prompt =
                 params.get("prompt").and_then(Value::as_str).ok_or("ai.picture needs {\"prompt\": \"…\", \"mode\": \"create\" | \"change\" | \"repaint\"}")?;
@@ -406,14 +435,14 @@ pub fn workflow(settings: &PictureSettings, mode: Mode, prompt: &str, size: (u32
 
 /// Ask ComfyUI which models it has, on a thread.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn list_models(app: &mut PhotocraftApp, ctx: &egui::Context) {
+pub fn list_models(app: &mut PhotocraftApp, ctx: Option<&egui::Context>) {
     let pictures = &mut app.ui.ai.pictures;
     if pictures.catalog_rx.is_some() {
         return;
     }
     let url = pictures.settings.comfy_url.clone();
     let (tx, rx) = std::sync::mpsc::channel();
-    let ctx = ctx.clone();
+    let ctx = ctx.cloned();
     std::thread::spawn(move || {
         let comfy = crate::ai_comfy::Comfy::new(&url);
         let catalog = (|| {
@@ -423,7 +452,9 @@ pub fn list_models(app: &mut PhotocraftApp, ctx: &egui::Context) {
             Ok(Catalog { models, text_encoders: comfy.models("text_encoders")?, vaes: comfy.models("vae")? })
         })();
         let _ = tx.send(catalog);
-        ctx.request_repaint();
+        if let Some(ctx) = ctx {
+            ctx.request_repaint();
+        }
     });
     pictures.catalog_rx = Some(rx);
 }
@@ -617,7 +648,7 @@ pub fn section(app: &mut PhotocraftApp, ui: &mut egui::Ui, t: &crate::theme::Tok
         }
     });
     if list {
-        list_models(app, ui.ctx());
+        list_models(app, Some(ui.ctx()));
     }
     if let Some((mode, prompt)) = go
         && let Err(e) = start(app, mode, &prompt, Some(ui.ctx()))
@@ -800,6 +831,17 @@ mod tests {
         let reply = rx.try_recv().expect("answered when the picture landed");
         assert_eq!(reply["ok"], true);
         assert!(reply["result"]["note"].as_str().unwrap().contains("AI: red"));
+    }
+
+    #[test]
+    fn picture_settings_change_by_command_but_not_by_a_busy_ai() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        let r = menu(&mut app, PICTURE_SETTINGS, &json!({"comfyUrl": "http://10.0.0.2:8188", "strength": 0.3, "bogus": 1})).unwrap().unwrap();
+        assert_eq!(r["comfyUrl"], "http://10.0.0.2:8188");
+        assert_eq!(app.ui.ai.pictures.settings.strength, 0.3);
+        app.ui.ai.busy = true;
+        assert!(menu(&mut app, PICTURE_SETTINGS, &json!({"comfyUrl": "http://elsewhere.example"})).unwrap().is_err());
+        assert_eq!(app.ui.ai.pictures.settings.comfy_url, "http://10.0.0.2:8188");
     }
 
     #[test]
