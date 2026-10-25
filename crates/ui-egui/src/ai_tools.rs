@@ -51,12 +51,17 @@ nothing more. Prefer edits that keep the original pixels: adjustment layers, new
 changing the image layer directly. Look up a command's id and parameters with command_list before running it, and look \
 at the result afterwards. Everything you do in one reply becomes a single undo step, so the user can take it all back \
 with one Ctrl+Z; say so if they seem unhappy with the result. You cannot open, save or export files: when the work is \
-done, remind the user to save. For new or repainted pixels (a picture from a description, replacing or adding an \
-object, a new style for the whole image), run command_run with id ai.picture and params {\"prompt\": \"…\", \"mode\": \
-\"create\" | \"change\" | \"repaint\", \"strength\": 0.1-1}. It uses the picture model set up in the panel's Pictures \
-section and adds the result as a new layer; repaint works on the current selection, so select the area first. Write \
-the prompt as a description of the picture, not an instruction. The reply waits for the picture; if it says it is \
-still busy, run ai.picture.status to wait again.";
+done, remind the user to save. For new pixels from the picture model set up in the panel's Pictures section, \
+run command_run with id ai.picture and params {\"prompt\": \"…\", \"mode\": \"repaint\" | \"change\" | \"create\", \
+\"strength\": 0.1-1}; the result arrives as a new layer. Pick the mode carefully. repaint is the usual one: it changes \
+only the selected area of the open picture, so to add, remove or replace something, first look at the image, then \
+select the area where it goes with select.rect {\"x\", \"y\", \"width\", \"height\"} in document pixels, then run \
+ai.picture with mode repaint and strength 0.8-1. change restyles the whole picture (strength 0.3-0.6 keeps it \
+recognisable). create makes a new, unrelated picture: use it only when the user asks for a brand-new picture, never \
+to edit the open one. Write the prompt as a caption of what the selected area should show afterwards, matching the \
+photo (for example \"a smiling man in a white shirt sitting on a cream leather boat seat, bright daylight\"), not as \
+an instruction. The reply waits for the picture; if it says it is still busy, run ai.picture.status to wait again. \
+For a plain colour or tone change, use an adjustment layer instead of a picture.";
 
 /// One action-log line for a tool the AI used (`input` is its arguments).
 pub(crate) fn describe(tool: &str, input: Option<&Value>) -> String {

@@ -194,7 +194,7 @@ impl Turn {
             if self.stopped() {
                 return Ok(());
             }
-            let text = reply.get("content").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let text = without_thinking(reply.get("content").and_then(Value::as_str).unwrap_or_default());
             if !text.trim().is_empty() {
                 let _ = self.tx.send(Event::Text(text.clone()));
             }
@@ -230,6 +230,29 @@ impl Turn {
         *self.history.lock().unwrap_or_else(PoisonError::into_inner) = without_images(messages);
         Ok(())
     }
+}
+
+/// A reply without the reasoning some models (Qwen3, DeepSeek-R1) write before their answer:
+/// `<think>…</think>` blocks, and everything up to a lone `</think>` when the chat template
+/// opened the block in the prompt.
+fn without_thinking(text: &str) -> String {
+    let mut rest = text;
+    if let Some(end) = rest.find("</think>")
+        && rest[..end].find("<think>").is_none()
+    {
+        rest = &rest[end + "</think>".len()..];
+    }
+    let mut out = String::with_capacity(rest.len());
+    while let Some(start) = rest.find("<think>") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("</think>") {
+            Some(end) => rest = &rest[start + end + "</think>".len()..],
+            // Unclosed: the rest is all reasoning.
+            None => rest = "",
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_owned()
 }
 
 /// A tool call the model asked for.
@@ -531,6 +554,15 @@ mod tests {
         );
         assert!(tool_calls(&json!({ "content": "hi" })).is_empty());
         assert_eq!(assistant_message("ok", &json!({ "tool_calls": [] })), json!({ "role": "assistant", "content": "ok" }));
+    }
+
+    #[test]
+    fn reasoning_is_left_out_of_the_reply() {
+        assert_eq!(without_thinking("<think>plan it</think>\n\nDone."), "Done.");
+        assert_eq!(without_thinking("So the steps are...\n</think>\n\nThe person was added."), "The person was added.");
+        assert_eq!(without_thinking("A <think>x</think>B<think>y</think> C"), "A B C");
+        assert_eq!(without_thinking("<think>still thinking"), "");
+        assert_eq!(without_thinking("Plain answer."), "Plain answer.");
     }
 
     #[test]
