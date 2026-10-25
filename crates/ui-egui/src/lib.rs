@@ -22,8 +22,11 @@ pub mod adjust_ui;
 #[cfg(not(target_arch = "wasm32"))]
 mod ai_claude;
 #[cfg(not(target_arch = "wasm32"))]
+mod ai_comfy;
+#[cfg(not(target_arch = "wasm32"))]
 mod ai_openai;
 pub mod ai_panel;
+pub mod ai_pictures;
 #[cfg(not(target_arch = "wasm32"))]
 mod ai_tools;
 mod alt_grab;
@@ -1820,6 +1823,7 @@ impl PhotocraftApp {
                 }
                 control::Outcome::AfterInput => self.input_waiters.push(reply),
                 control::Outcome::AfterJob(job) => self.jobs.waiters.push((job, reply)),
+                control::Outcome::AfterPicture => self.ui.ai.pictures.wait(reply),
                 control::Outcome::Screenshot { token, path } => {
                     // Wait out egui's fade animations (~83 ms) and a few rendered frames first.
                     let settle = ctx.global_style().animation_time as f64 * 2000.0 + 60.0;

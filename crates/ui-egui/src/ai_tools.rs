@@ -51,7 +51,12 @@ nothing more. Prefer edits that keep the original pixels: adjustment layers, new
 changing the image layer directly. Look up a command's id and parameters with command_list before running it, and look \
 at the result afterwards. Everything you do in one reply becomes a single undo step, so the user can take it all back \
 with one Ctrl+Z; say so if they seem unhappy with the result. You cannot open, save or export files: when the work is \
-done, remind the user to save.";
+done, remind the user to save. For new or repainted pixels (a picture from a description, replacing or adding an \
+object, a new style for the whole image), run command_run with id ai.picture and params {\"prompt\": \"…\", \"mode\": \
+\"create\" | \"change\" | \"repaint\", \"strength\": 0.1-1}. It uses the picture model set up in the panel's Pictures \
+section and adds the result as a new layer; repaint works on the current selection, so select the area first. Write \
+the prompt as a description of the picture, not an instruction. The reply waits for the picture; if it says it is \
+still busy, run ai.picture.status to wait again.";
 
 /// One action-log line for a tool the AI used (`input` is its arguments).
 pub(crate) fn describe(tool: &str, input: Option<&Value>) -> String {

@@ -125,6 +125,9 @@ pub enum Outcome {
     /// A command started a background job and the caller waits for it: reply with its result
     /// once it has been applied (or with its error / "cancelled").
     AfterJob(photocraft_engine::jobs::JobId),
+    /// Dalivinci: an `ai.picture` request; reply once the picture is in (or after a while, that
+    /// it's still coming).
+    AfterPicture,
 }
 
 /// The fields `ui.set` reads. Anything else is rejected before a field is applied, and every
@@ -431,6 +434,12 @@ fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) 
             // `engine.execute` is programmatic: engine commands run directly with their default
             // params and never open a dialog (an agent would otherwise get a modal instead of a
             // result). `ui.menu.invoke` behaves like a menu click, so it may open the dialog.
+            if matches!(id, crate::ai_pictures::PICTURE | crate::ai_pictures::STATUS) {
+                return match crate::menus::invoke(app, ctx, id, params) {
+                    Ok(_) if app.ui.ai.pictures.busy() => Outcome::AfterPicture,
+                    other => wrap(other),
+                };
+            }
             if req.method == "engine.execute" && photocraft_engine::commands::find(id).is_some() {
                 return run_waiting(app, wait, |app| app.run(id, params));
             }

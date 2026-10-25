@@ -290,6 +290,9 @@ pub struct AiPanelUi {
     link: Option<McpLink>,
     #[serde(skip)]
     turn_start: Option<TurnStart>,
+    /// The Pictures (ComfyUI) section.
+    #[serde(default)]
+    pub pictures: crate::ai_pictures::PicturesUi,
 }
 
 impl PartialEq for AiPanelUi {
@@ -298,6 +301,7 @@ impl PartialEq for AiPanelUi {
             && self.provider == other.provider
             && self.local_only == other.local_only
             && self.settings == other.settings
+            && self.pictures == other.pictures
             && self.messages == other.messages
             && self.actions == other.actions
             && self.busy == other.busy
@@ -540,7 +544,7 @@ impl std::fmt::Debug for TurnStart {
 }
 
 /// History label for an AI turn: "AI: " and the start of what was asked.
-fn step_label(prompt: &str) -> String {
+pub(crate) fn step_label(prompt: &str) -> String {
     const MAX: usize = 40;
     let words = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     if words.chars().count() <= MAX {
@@ -613,7 +617,7 @@ pub(crate) fn merge(a: std::sync::mpsc::Receiver<ControlRequest>, b: std::sync::
 
 /// Ids this module owns.
 pub fn handles(id: &str) -> bool {
-    matches!(id, TOGGLE | SEND | STOP | CLEAR | PROVIDER | SETTINGS)
+    matches!(id, TOGGLE | SEND | STOP | CLEAR | PROVIDER | SETTINGS | crate::ai_pictures::PICTURE | crate::ai_pictures::STATUS)
 }
 
 /// Menu checkmark for Window › AI Assistant.
@@ -624,6 +628,13 @@ pub fn checked(app: &PhotocraftApp, id: &str) -> Option<bool> {
 /// Run one of this module's ids. `window.panel.aiAssistant` toggles the panel, or sets it with
 /// `{"open": bool}`.
 pub fn menu(app: &mut PhotocraftApp, id: &str, params: &Value) -> Option<Result<Value, String>> {
+    if let Some(r) = crate::ai_pictures::menu(app, id, params) {
+        return Some(r);
+    }
+    // The AI reaches these ids too (through command_run): it may not reconfigure itself mid-reply.
+    if app.ui.ai.busy && matches!(id, PROVIDER | SETTINGS | CLEAR) {
+        return Some(Err("Not while the AI is answering.".into()));
+    }
     if id == SEND {
         return Some(match params.get("text").and_then(Value::as_str) {
             Some(text) => send(app, text).map(|()| {
@@ -688,8 +699,11 @@ pub fn side_panel(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     app.ui.ai_clock = now;
     app.ui.ai.poll(now);
     fold_turn(app);
+    crate::ai_pictures::poll(app);
     if app.ui.ai.busy {
         ui.ctx().request_repaint();
+    } else if app.ui.ai.pictures.busy() {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
     }
     if !app.ui.ai.open {
         return;
@@ -743,6 +757,8 @@ fn panel_body(app: &mut PhotocraftApp, ui: &mut egui::Ui, t: &Tokens) {
     if matches!(ai.provider, Provider::Ollama | Provider::Gemini) {
         connection(app, ui, t);
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::ai_pictures::section(app, ui, t);
     let ai = &mut app.ui.ai;
     ui.separator();
 
